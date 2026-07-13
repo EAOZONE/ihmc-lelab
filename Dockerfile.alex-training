@@ -1,0 +1,31 @@
+FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    HF_HOME=/cache/huggingface \
+    PYTHONUNBUFFERED=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ffmpeg git python-is-python3 python3 python3-pip python3-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+# The CUDA base image and gpu2 driver expose CUDA 12.8. Installing LeRobot
+# without an explicit PyTorch index can select a newer cu130 wheel that imports
+# successfully but cannot initialize a GPU with that driver.
+RUN python3 -m pip install --break-system-packages --no-cache-dir \
+        torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 \
+        --index-url https://download.pytorch.org/whl/cu128
+
+# Keep this pin aligned with the Alex Lab runtime. The explicit extras are the
+# policy families supported by LeRobot's standard offline training pipeline.
+RUN python3 -m pip install --break-system-packages --no-cache-dir \
+    "lerobot[training,diffusion,pi,smolvla,groot,eo1,evo1,fastwam,lingbot-va,molmoact2,multi-task-dit,vla-jepa,wallx,xvla]==0.6.0"
+
+# LeRobot serializes non-finite JSON stats as strings. Load those values as
+# numeric arrays and derive unusable std entries from the finite min/max range.
+# The Hub dataset is never modified; this is an in-memory compatibility layer.
+COPY docker/alex_lerobot_compat.py /usr/local/lib/python3.12/dist-packages/alex_lerobot_compat.py
+COPY docker/alex_lerobot_compat.pth /usr/local/lib/python3.12/dist-packages/alex_lerobot_compat.pth
+
+RUN python3 -c "import alex_lerobot_compat, torch; assert torch.version.cuda == '12.8', (torch.__version__, torch.version.cuda); assert alex_lerobot_compat.ALEX_STATS_SANITIZER"
+
+CMD ["lerobot-train"]
