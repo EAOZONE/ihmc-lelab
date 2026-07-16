@@ -7,7 +7,7 @@ const navigation = [
   { to: "/", label: "Dashboard", icon: LayoutDashboard },
   { to: "/datasets", label: "Datasets", icon: Database },
   { to: "/training", label: "Training", icon: ChartNoAxesCombined },
-  { to: "/evaluation", label: "Rollout", icon: FlaskConical },
+  { to: "/evaluation", label: "Evaluation", icon: FlaskConical },
   { to: "/teleop", label: "Teleop", icon: Gamepad2 },
 ];
 

@@ -131,7 +131,7 @@ def build_training_command(
     if request.dataset_root:
         cmd.extend(["--dataset.root", request.dataset_root])
     if request.dataset_episodes:
-        cmd.extend(["--dataset.episodes"] + [str(ep) for ep in request.dataset_episodes])
+        cmd.extend(["--dataset.episodes", json.dumps(request.dataset_episodes)])
     if request.dataset_image_transforms_enable:
         cmd.extend(["--dataset.image_transforms.enable", "true"])
 

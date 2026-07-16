@@ -70,7 +70,11 @@ def resolve_rollout_source(config: RolloutConfig, jobs: RemoteJobManager) -> tup
             raise ValueError("checkpoint must be 'latest' or a numeric training step")
     else:
         assert config.policy_ref is not None
-        policy_ref = str(Path(config.policy_ref).expanduser()) if Path(config.policy_ref).expanduser().exists() else config.policy_ref
+        policy_ref = (
+            str(Path(config.policy_ref).expanduser())
+            if Path(config.policy_ref).expanduser().exists()
+            else config.policy_ref
+        )
         if "@" not in policy_ref and not Path(policy_ref).is_dir():
             if config.checkpoint == "latest":
                 policy_ref = f"{policy_ref}@latest"
@@ -134,16 +138,36 @@ def build_inference_container_command(
 ) -> str:
     name = f"alex-rollout-{rollout_id}"[:63]
     argv = [
-        "docker", "run", "--detach", "--name", name,
-        "--network", "host",
-        "--gpus", f'"device={gpu_uuid}"',
-        "--shm-size", "16g",
-        "--label", f"alex.rollout_id={rollout_id}",
-        "--env", "HF_TOKEN", "--env", "HF_HOME=/cache/huggingface",
-        "--volume", "alex_hf_cache:/cache/huggingface",
+        "docker",
+        "run",
+        "--detach",
+        "--name",
+        name,
+        "--network",
+        "host",
+        "--gpus",
+        f'"device={gpu_uuid}"',
+        "--shm-size",
+        "16g",
+        "--label",
+        f"alex.rollout_id={rollout_id}",
+        "--env",
+        "HF_TOKEN",
+        "--env",
+        "HF_HOME=/cache/huggingface",
+        "--volume",
+        "alex_hf_cache:/cache/huggingface",
         remote_training_image(),
-        "python3", "/opt/alex/alex_policy_server.py",
-        "--policy", policy_ref, "--host", "127.0.0.1", "--port", str(port), "--device", "cuda",
+        "python3",
+        "/opt/alex/alex_policy_server.py",
+        "--policy",
+        policy_ref,
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(port),
+        "--device",
+        "cuda",
     ]
     return remote_hf_token_prelude() + shlex.join(argv)
 
@@ -165,17 +189,37 @@ def build_local_inference_container_command(
         volume_args = ["--volume", f"{resolved}:{_LOCAL_POLICY_MOUNT}:ro"]
         mounted_policy_ref = _LOCAL_POLICY_MOUNT
     return [
-        "docker", "run", "--detach", "--name", name,
-        "--network", "host",
-        "--gpus", gpu_request,
-        "--shm-size", "16g",
-        "--label", f"alex.rollout_id={rollout_id}",
-        "--env", "HF_TOKEN", "--env", "HF_HOME=/cache/huggingface",
-        "--volume", "alex_hf_cache:/cache/huggingface",
+        "docker",
+        "run",
+        "--detach",
+        "--name",
+        name,
+        "--network",
+        "host",
+        "--gpus",
+        gpu_request,
+        "--shm-size",
+        "16g",
+        "--label",
+        f"alex.rollout_id={rollout_id}",
+        "--env",
+        "HF_TOKEN",
+        "--env",
+        "HF_HOME=/cache/huggingface",
+        "--volume",
+        "alex_hf_cache:/cache/huggingface",
         *volume_args,
         remote_training_image(),
-        "python3", "/opt/alex/alex_policy_server.py",
-        "--policy", mounted_policy_ref, "--host", "127.0.0.1", "--port", str(port), "--device", "cuda",
+        "python3",
+        "/opt/alex/alex_policy_server.py",
+        "--policy",
+        mounted_policy_ref,
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(port),
+        "--device",
+        "cuda",
     ]
 
 
@@ -282,15 +326,6 @@ class RolloutManager:
             return result.returncode == 0 and result.stdout.strip().lower() == "false"
         return False
 
-    @staticmethod
-    def _hardware_blockers() -> list[str]:
-        return [
-            "authoritative Alex state readback provider is not configured",
-            "pelvis/world frame transform provider is not configured",
-            "complete forearm, neck, and Ability Hand action sinks are not configured",
-            "hardware watchdog/deadman acknowledgement is unavailable",
-        ]
-
     def start(self, config: RolloutConfig) -> RolloutRecord:
         policy_ref, manifest = resolve_rollout_source(config, self.jobs)
         if config.inference_location == "remote" and Path(policy_ref).expanduser().is_dir():
@@ -308,21 +343,15 @@ class RolloutManager:
             started_at=time.time(),
             log_path=str(log_path),
         )
-        if config.target == "robot":
-            record.state = "blocked"
-            record.ended_at = time.time()
-            record.blockers = self._hardware_blockers()
-            record.error_message = "Real Alex rollout is safety-gated until every hardware capability is available"
-            self._records[record.id] = record
-            self._persist(record)
-            return record
 
         if config.target == "sim":
             isaaclab_root = Path(config.isaaclab_root).expanduser().resolve()
             if not (isaaclab_root / "isaaclab.sh").is_file():
                 raise FileNotFoundError(f"Isaac Lab launcher not found: {isaaclab_root / 'isaaclab.sh'}")
-        else:
+        elif config.target == "arena":
             self._require_arena_container(config.container_name)
+        # target == "robot": no local runner to validate - the inference container is
+        # the only thing this manager launches, and RDXOperatorUI drives the robot itself.
 
         gpu_uuid = self._select_gpu(config.gpu) if config.inference_location == "remote" else config.gpu
         remote_port = 24000 + (int(uuid.uuid4().hex[:4], 16) % 16000)
@@ -336,10 +365,14 @@ class RolloutManager:
         handle = None
         try:
             if config.inference_location == "local":
-                command = build_local_inference_container_command(rollout_id, policy_ref, gpu_uuid, remote_port)
+                command = build_local_inference_container_command(
+                    rollout_id, policy_ref, gpu_uuid, remote_port
+                )
                 result = subprocess.run(command, check=False, capture_output=True, text=True, timeout=60)
                 if result.returncode:
-                    raise RuntimeError((result.stderr or result.stdout).strip() or "policy-server container failed to start")
+                    raise RuntimeError(
+                        (result.stderr or result.stdout).strip() or "policy-server container failed to start"
+                    )
                 schema = self._wait_ready(remote_port, record=record)
                 inference_port = remote_port
             else:
@@ -351,7 +384,21 @@ class RolloutManager:
                 self._tunnels[record.id] = tunnel
                 schema = self._wait_policy_server_ready(record, tunnel.local_port)
                 inference_port = tunnel.local_port
+            # record.inference_port started out as remote_port (the training host's own
+            # port), which callers can't reach directly when inference_location=="remote" -
+            # replace it with the locally-reachable port (the tunnel's) once known, so
+            # RolloutRecord.inference_port is always the port a client should connect to.
+            record.inference_port = inference_port
             manifest["policy_schema"] = schema
+            record.manifest = manifest
+            if config.target == "robot":
+                # No local runner to launch - the inference container is the whole of
+                # what this manager owns for a robot rollout. RDXOperatorUI connects to
+                # inference_port directly and drives the robot itself.
+                record.state = "running"
+                self._persist(record)
+                return record
+
             artifact_dir = self._dir(record.id) / "artifacts"
             metrics_path = artifact_dir / "metrics.json"
             if (config.video or config.camera_video) and not config.video_dir:
@@ -419,8 +466,7 @@ class RolloutManager:
         if result.returncode != 0 or result.stdout.strip().lower() != "true":
             detail = (result.stderr or result.stdout or "").strip()
             raise RuntimeError(
-                f"Arena container {container_name!r} is not running"
-                + (f": {detail}" if detail else "")
+                f"Arena container {container_name!r} is not running" + (f": {detail}" if detail else "")
             )
 
     def _remote_container_diagnostics(self, record: RolloutRecord) -> str:
@@ -450,9 +496,13 @@ class RolloutManager:
         with contextlib.suppress(Exception):
             status = subprocess.run(
                 [
-                    "docker", "ps", "-a",
-                    "--filter", f"name=^{record.inference_container}$",
-                    "--format", "{{.Names}} {{.Status}}",
+                    "docker",
+                    "ps",
+                    "-a",
+                    "--filter",
+                    f"name=^{record.inference_container}$",
+                    "--format",
+                    "{{.Names}} {{.Status}}",
                 ],
                 check=False,
                 capture_output=True,
@@ -527,10 +577,10 @@ class RolloutManager:
             # the local Isaac Lab runner. Arena policy_runner does not write metrics.json.
             if error_path.is_file():
                 record.state = "failed"
-                record.error_message = error_path.read_text(errors="replace").strip() or "Isaac Lab rollout failed"
-            elif process.returncode == 0 and (
-                record.config.target == "arena" or metrics_path.is_file()
-            ):
+                record.error_message = (
+                    error_path.read_text(errors="replace").strip() or "Isaac Lab rollout failed"
+                )
+            elif process.returncode == 0 and (record.config.target == "arena" or metrics_path.is_file()):
                 record.state = "done"
             elif process.returncode == 0:
                 record.state = "failed"
@@ -542,10 +592,24 @@ class RolloutManager:
             self._processes.pop(rollout_id, None)
             self._cleanup(record)
             self._persist(record)
+        elif record.state == "running" and record.config.target == "robot":
+            exited = (
+                self._local_container_exited(record)
+                if record.config.inference_location == "local"
+                else self._remote_container_exited(record)
+            )
+            if exited:
+                record.state = "failed"
+                record.ended_at = time.time()
+                record.error_message = "policy-server container exited unexpectedly"
+                self._cleanup(record)
+                self._persist(record)
         return record
 
     def list(self) -> list[RolloutRecord]:
-        return sorted((self.get(item) for item in list(self._records)), key=lambda r: r.started_at, reverse=True)
+        return sorted(
+            (self.get(item) for item in list(self._records)), key=lambda r: r.started_at, reverse=True
+        )
 
     def reattach(self) -> list[RolloutRecord]:
         """Reconcile persisted rollouts after reconnecting to the GPU host.

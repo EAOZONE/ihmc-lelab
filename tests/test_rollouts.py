@@ -1,3 +1,4 @@
+import time
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -6,10 +7,36 @@ import pytest
 from lelab.alex_models import RolloutConfig
 from lelab.rollouts import (
     RolloutManager,
+    RolloutRecord,
     build_inference_container_command,
     build_local_inference_container_command,
     resolve_rollout_source,
 )
+
+
+def _seed_record(manager: RolloutManager, **overrides) -> RolloutRecord:
+    """Persist a stub RolloutRecord directly, bypassing start()'s GPU/container launch.
+
+    Used by tests that only care about get()/stop()/reattach() behavior on an
+    already-"running" record, not about how it got there.
+    """
+    rollout_id = overrides.pop("id", "rollout-test")
+    config = overrides.pop(
+        "config", RolloutConfig(target="sim", policy_ref="owner/model", dataset_repo_id="owner/dataset")
+    )
+    record = RolloutRecord(
+        id=rollout_id,
+        state=overrides.pop("state", "running"),
+        config=config,
+        policy_ref="owner/model@latest",
+        manifest={},
+        started_at=time.time(),
+        log_path=str(manager._dir(rollout_id) / "rollout.log"),
+        **overrides,
+    )
+    manager._records[record.id] = record
+    manager._persist(record)
+    return record
 
 
 def test_rollout_config_requires_exactly_one_source() -> None:
@@ -88,20 +115,72 @@ def test_remote_inference_rejects_local_policy_path(tmp_path: Path) -> None:
     manager = RolloutManager(tmp_path / "rollouts", cluster=MagicMock(), jobs=MagicMock())
 
     with pytest.raises(ValueError, match="local policy_ref paths require local inference"):
-        manager.start(
-            RolloutConfig(target="arena", policy_ref=str(policy), dataset_repo_id="owner/dataset")
-        )
+        manager.start(RolloutConfig(target="arena", policy_ref=str(policy), dataset_repo_id="owner/dataset"))
 
 
-def test_physical_alex_rollout_returns_structured_safety_blockers(tmp_path: Path) -> None:
-    manager = RolloutManager(tmp_path, cluster=MagicMock(), jobs=MagicMock())
+def test_robot_rollout_launches_inference_container_without_runner(tmp_path: Path, monkeypatch) -> None:
+    cluster = MagicMock()
+    cluster.gpus.return_value = [{"index": 0, "uuid": "GPU-a"}]
+    cluster.execute.return_value = (0, "container", "")
+    tunnel = MagicMock(local_port=45678)
+    cluster.forward_remote_port.return_value = tunnel
+    manager = RolloutManager(tmp_path, cluster=cluster, jobs=MagicMock())
+    monkeypatch.setattr(manager, "_wait_policy_server_ready", lambda _record, _port: {"protocol_version": 1})
+
+    popen = MagicMock()
+    monkeypatch.setattr("lelab.rollouts.subprocess.Popen", popen)
+
     record = manager.start(
         RolloutConfig(target="robot", policy_ref="owner/model", dataset_repo_id="owner/dataset")
     )
-    assert record.state == "blocked"
-    assert len(record.blockers) == 4
-    assert "state readback" in " ".join(record.blockers)
+
+    assert record.state == "running"
+    assert record.pid is None
+    assert record.inference_container is not None
+    assert record.inference_port == 45678
+    assert record.manifest["policy_schema"] == {"protocol_version": 1}
+    popen.assert_not_called()
     assert (tmp_path / record.id / "rollout.json").is_file()
+
+
+def test_robot_rollout_get_marks_failed_when_container_exits(tmp_path: Path) -> None:
+    cluster = MagicMock()
+    cluster.status.return_value = {"connected": True}
+    cluster.execute.return_value = (0, "false", "")
+    manager = RolloutManager(tmp_path, cluster=cluster, jobs=MagicMock())
+    record = _seed_record(
+        manager,
+        config=RolloutConfig(target="robot", policy_ref="owner/model", dataset_repo_id="owner/dataset"),
+        inference_container="alex-rollout-robot",
+    )
+
+    updated = manager.get(record.id)
+
+    assert updated.state == "failed"
+    assert "exited unexpectedly" in updated.error_message
+
+
+def test_robot_rollout_stop_tears_down_container_without_process(tmp_path: Path) -> None:
+    cluster = MagicMock()
+    cluster.status.return_value = {"connected": True}
+
+    def execute(command, timeout=30):
+        if "docker inspect" in command:
+            return 0, "true", ""  # container is still alive when stop() checks liveness first
+        return 0, "", ""
+
+    cluster.execute.side_effect = execute
+    manager = RolloutManager(tmp_path, cluster=cluster, jobs=MagicMock())
+    record = _seed_record(
+        manager,
+        config=RolloutConfig(target="robot", policy_ref="owner/model", dataset_repo_id="owner/dataset"),
+        inference_container="alex-rollout-robot",
+    )
+
+    updated = manager.stop(record.id)
+
+    assert updated.state == "stopped"
+    cluster.execute.assert_any_call("docker rm --force alex-rollout-robot", timeout=20)
 
 
 def test_sim_rollout_requires_isaaclab_launcher(tmp_path: Path) -> None:
@@ -222,13 +301,11 @@ def test_arena_rollout_can_use_local_inference_container(tmp_path: Path, monkeyp
 def test_exit_zero_without_metrics_is_failed_for_sim(tmp_path: Path) -> None:
     """SimulationApp.close() can hard-exit 0 after gym.make fails without cfg."""
     manager = RolloutManager(tmp_path, cluster=MagicMock(), jobs=MagicMock())
-    record = manager.start(
-        RolloutConfig(target="robot", policy_ref="owner/model", dataset_repo_id="owner/dataset")
+    record = _seed_record(
+        manager,
+        config=RolloutConfig(target="sim", policy_ref="owner/model", dataset_repo_id="owner/dataset"),
+        pid=1,
     )
-    record.state = "running"
-    record.config = record.config.model_copy(update={"target": "sim"})
-    record.pid = 1
-    manager._persist(record)
 
     proc = MagicMock()
     proc.poll.return_value = 0
@@ -242,13 +319,11 @@ def test_exit_zero_without_metrics_is_failed_for_sim(tmp_path: Path) -> None:
 
 def test_arena_exit_zero_without_metrics_is_done(tmp_path: Path) -> None:
     manager = RolloutManager(tmp_path, cluster=MagicMock(), jobs=MagicMock())
-    record = manager.start(
-        RolloutConfig(target="robot", policy_ref="owner/model", dataset_repo_id="owner/dataset")
+    record = _seed_record(
+        manager,
+        config=RolloutConfig(target="arena", policy_ref="owner/model", dataset_repo_id="owner/dataset"),
+        pid=1,
     )
-    record.state = "running"
-    record.config = record.config.model_copy(update={"target": "arena"})
-    record.pid = 1
-    manager._persist(record)
 
     proc = MagicMock()
     proc.poll.return_value = 0
@@ -263,9 +338,7 @@ def test_reattach_removes_interrupted_inference_container(tmp_path: Path) -> Non
     cluster = MagicMock()
     cluster.status.return_value = {"connected": True}
     manager = RolloutManager(tmp_path, cluster=cluster, jobs=MagicMock())
-    record = manager.start(
-        RolloutConfig(target="robot", policy_ref="owner/model", dataset_repo_id="owner/dataset")
-    )
+    record = _seed_record(manager)
     record.state = "interrupted"
     record.inference_container = "alex-rollout-old"
 
@@ -295,7 +368,11 @@ def test_sim_rollout_failure_includes_container_diagnostics(tmp_path: Path, monk
 
     cluster.execute.side_effect = execute
     manager = RolloutManager(tmp_path / "rollouts", cluster=cluster, jobs=MagicMock())
-    monkeypatch.setattr(manager, "_wait_policy_server_ready", lambda _record, _port: (_ for _ in ()).throw(TimeoutError("not ready")))
+    monkeypatch.setattr(
+        manager,
+        "_wait_policy_server_ready",
+        lambda _record, _port: (_ for _ in ()).throw(TimeoutError("not ready")),
+    )
 
     with pytest.raises(RuntimeError, match="policy load failed"):
         manager.start(

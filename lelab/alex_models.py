@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import shlex
 from pathlib import Path
@@ -70,6 +71,36 @@ class DatasetConversionConfig(BaseModel):
         return self
 
 
+class DemoAnnotationConfig(BaseModel):
+    """Arena HDF5 demo annotation using the existing IsaacLab-Arena script."""
+
+    input_file: str
+    output_file: str
+    environment: str = "alex_lever_turn"
+    embodiment: str = "alex_v2_ability_hands"
+    usd: str = "isaaclab_arena/assets/lever_sim/another_try_lever.usd"
+    device: str = "cuda"
+    viz: Literal["kit", "none"] = "kit"
+    mimic: bool = True
+    lever_dr: bool = True
+    lever_pose_dr_xy_jitter: float | None = 0.08
+    lever_pose_dr_yaw_jitter_deg: float | None = 15.0
+    success_angle_threshold: float | None = 0.7853981633974483
+    wrist_stiffness: int | None = 800
+    wrist_damping: int | None = 50
+    arena_workdir: str = "/workspaces/isaaclab_arena"
+    python_executable: str = "/isaac-sim/python.sh"
+    container_name: str | None = None
+
+    @field_validator("device")
+    @classmethod
+    def non_empty_device(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("device cannot be empty")
+        return value
+
+
 class GR00TTrainingConfig(BaseModel):
     kind: Literal["gr00t"] = "gr00t"
     dataset_id: str
@@ -131,6 +162,7 @@ class LeRobotTrainingConfig(BaseModel):
     kind: Literal["lerobot"] = "lerobot"
     dataset_repo_id: str
     dataset_revision: str | None = None
+    dataset_episodes: list[int] | None = None
     model_repo_id: str
     policy_type: str = "act"
     policy_pretrained_path: str | None = None
@@ -173,6 +205,17 @@ class LeRobotTrainingConfig(BaseModel):
             raise ValueError("invalid policy type")
         return value
 
+    @field_validator("dataset_episodes")
+    @classmethod
+    def valid_dataset_episodes(cls, value: list[int] | None) -> list[int] | None:
+        if value is None:
+            return value
+        if any(episode < 0 for episode in value):
+            raise ValueError("dataset episodes must be non-negative")
+        if len(value) != len(set(value)):
+            raise ValueError("dataset episodes must be unique")
+        return value
+
     @model_validator(mode="after")
     def policy_specific_fields(self) -> LeRobotTrainingConfig:
         groot_values = (
@@ -209,6 +252,35 @@ class RemoteTrainingRequest(BaseModel):
         if len(set(normalized)) != len(normalized):
             raise ValueError("GPU identifiers must be unique")
         return normalized
+
+
+class DatasetEvalConfig(BaseModel):
+    """Offline loss evaluation of a LeRobot policy over selected dataset episodes."""
+
+    job_id: str | None = None
+    policy_ref: str | None = None
+    checkpoint: str = "latest"
+    dataset_repo_id: str | None = None
+    dataset_revision: str | None = None
+    dataset_episodes: list[int]
+    gpu: str = "0"
+    batch_size: int = Field(default=8, ge=1)
+    num_workers: int = Field(default=4, ge=0)
+    policy_use_bf16: bool = False
+
+    @model_validator(mode="after")
+    def validate_sources(self) -> DatasetEvalConfig:
+        if bool(self.job_id) == bool(self.policy_ref):
+            raise ValueError("provide exactly one of job_id or policy_ref")
+        if self.policy_ref and not self.dataset_repo_id:
+            raise ValueError("dataset_repo_id is required when policy_ref is provided")
+        if not self.dataset_episodes:
+            raise ValueError("dataset_episodes is required")
+        if any(episode < 0 for episode in self.dataset_episodes):
+            raise ValueError("dataset episodes must be non-negative")
+        if len(self.dataset_episodes) != len(set(self.dataset_episodes)):
+            raise ValueError("dataset episodes must be unique")
+        return self
 
 
 def build_lerobot_training_command(
@@ -279,8 +351,9 @@ def build_lerobot_training_command(
         command += ["--policy.path", config.policy_pretrained_path]
     else:
         command += ["--policy.type", config.policy_type]
-    if config.dataset_revision:
-        command += ["--dataset.revision", config.dataset_revision]
+    command += ["--dataset.revision", config.dataset_revision or "main"]
+    if config.dataset_episodes:
+        command += ["--dataset.episodes", json.dumps(config.dataset_episodes)]
     if config.seed is not None:
         command += ["--seed", str(config.seed)]
     if config.wandb_enable and config.wandb_project:
@@ -305,12 +378,65 @@ def build_lerobot_training_command(
                 rendered = str(value).lower() if isinstance(value, bool) else str(value)
                 command += [flag, rendered]
         if config.policy_relative_exclude_joints is not None:
-            import json
-
             command += [
                 "--policy.relative_exclude_joints",
                 json.dumps(config.policy_relative_exclude_joints),
             ]
+    return command
+
+
+def build_demo_annotation_env(config: DemoAnnotationConfig) -> dict[str, str]:
+    """Return environment overrides needed by Arena's mimic annotation path."""
+    env: dict[str, str] = {}
+    if config.wrist_stiffness is not None:
+        env["ALEX_TELEOP_WRIST_STIFFNESS"] = str(config.wrist_stiffness)
+    if config.wrist_damping is not None:
+        env["ALEX_TELEOP_WRIST_DAMPING"] = str(config.wrist_damping)
+    return env
+
+
+def build_demo_annotation_command(config: DemoAnnotationConfig) -> list[str]:
+    """Build the minimal command for Arena's annotate_demos.py workflow.
+
+    The heavy dependencies stay in IsaacLab-Arena/Isaac Sim. Alex Lab only owns
+    this launcher contract so teleop, training, annotation, and rollout can be
+    driven from one repo without copying Arena internals.
+    """
+    script = "isaaclab_arena/scripts/imitation_learning/annotate_demos.py"
+    command = [
+        config.python_executable,
+        script,
+        "--device",
+        config.device,
+        "--viz",
+        config.viz,
+    ]
+    if config.mimic:
+        command.append("--mimic")
+    command += [
+        "--input_file",
+        config.input_file,
+        "--output_file",
+        config.output_file,
+        config.environment,
+        "--embodiment",
+        config.embodiment,
+        "--usd",
+        config.usd,
+    ]
+    if config.lever_dr:
+        command.append("--lever_dr")
+    if config.lever_pose_dr_xy_jitter is not None:
+        command += ["--lever_pose_dr_xy_jitter", str(config.lever_pose_dr_xy_jitter)]
+    if config.lever_pose_dr_yaw_jitter_deg is not None:
+        command += ["--lever_pose_dr_yaw_jitter_deg", str(config.lever_pose_dr_yaw_jitter_deg)]
+    if config.success_angle_threshold is not None:
+        command += ["--success_angle_threshold", str(config.success_angle_threshold)]
+    if config.container_name:
+        docker_prefix = ["docker", "exec", "-w", config.arena_workdir]
+        for key, value in build_demo_annotation_env(config).items():
+            docker_prefix += ["-e", f"{key}={value}"]
+        command = [*docker_prefix, config.container_name, *command]
     return command
 
 

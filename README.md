@@ -70,6 +70,18 @@ For **Captury teleop in Isaac Lab-Arena** (lever on `alex_empty`), HDF5 → LeRo
 conversion, Hugging Face upload, and training/rollout in this app, see
 [`docs/CAPTURY_TO_LEROBOT_TRAINING.md`](docs/CAPTURY_TO_LEROBOT_TRAINING.md).
 
+## Repo-owned boundary
+
+Alex Lab is the single operator entry point, but it only owns the orchestration
+code that needs to live here:
+
+| Workflow | This repo owns | External implementation |
+|---|---|---|
+| Teleop | `TeleopConfig`, `build_isaaclab_teleop_command`, `TeleopManager`, `alexlab teleop` | Isaac Lab task/device scripts |
+| Mimic annotation | `DemoAnnotationConfig`, `build_demo_annotation_command`, `alexlab annotate-demos` | IsaacLab-Arena `annotate_demos.py`, mimic logic, USD/task setup |
+| Training | LeRobot request schemas, compatibility checks, remote Docker/HF launch, `alexlab train-command` | LeRobot trainer and policy code |
+| Rollout | Policy source resolution, policy server launch, rollout manifests, `alexlab rollout` | Isaac Lab runner, Arena `policy_runner.py`, LeRobot policy server |
+
 ## Training
 
 The Training page refreshes GPU utilization, memory, temperature, power, and
@@ -108,12 +120,31 @@ by Alex Lab are displayed as occupied and are never terminated.
 GR00T uses LeRobot's standard GR00T N1.7 policy integration. Legacy CCIL and
 custom GR00T jobs remain visible in job history but cannot be launched.
 
+To inspect the exact in-container LeRobot command without starting a remote job:
+
+```bash
+alexlab train-command --dataset-repo <owner/dataset> --model-repo <owner/model> \
+  --policy-type groot --policy-base-model-path nvidia/GR00T-N1.7-3B
+```
+
 ## Rollout
 
 Rollout loads a schema-compatible LeRobot checkpoint on one GPU of the connected
 training host and forwards its typed observation/action protocol through the
 existing authenticated SSH connection. Isaac Lab/Isaac Sim runs locally and
 owns the Alex simulator state, episode metrics, and viewport/camera videos.
+
+## Teleop
+
+Alex Lab owns the thin launcher for local Isaac Lab teleoperation; Isaac Lab
+still owns the simulator, task registration, viewer, and device implementation.
+
+```bash
+alexlab teleop --environment Isaac-Alex-Lever-Play-v0 --teleop-device keyboard
+alexlab teleop-status <teleop-id>
+alexlab teleop-logs <teleop-id>
+alexlab teleop-stop <teleop-id>
+```
 
 From the UI, open **Rollout** and select a completed training job. The equivalent
 CLI is:

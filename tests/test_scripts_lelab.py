@@ -22,6 +22,7 @@ from __future__ import annotations
 import socket
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -457,3 +458,185 @@ def test_rollout_cli_parser_supports_job_and_direct_policy_sources() -> None:
     )
     assert direct.policy_ref == "owner/model"
     assert direct.target == "robot"
+
+
+def test_teleop_cli_parser_supports_local_isaaclab_options() -> None:
+    from lelab.scripts.lelab import _build_parser
+
+    args = _build_parser().parse_args(
+        [
+            "teleop",
+            "--environment",
+            "Isaac-Alex-Lever-Play-v0",
+            "--teleop-device",
+            "spacemouse",
+            "--num-envs",
+            "2",
+            "--sensitivity",
+            "1.5",
+            "--isaaclab-root",
+            "/opt/IsaacLab",
+        ]
+    )
+
+    assert args.command == "teleop"
+    assert args.teleop_device == "spacemouse"
+    assert args.num_envs == 2
+    assert args.sensitivity == 1.5
+    assert args.isaaclab_root == "/opt/IsaacLab"
+
+
+def test_teleop_cli_starts_existing_manager(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    import lelab.alex_teleop as alex_teleop
+    from lelab.scripts.lelab import main
+
+    captured = {}
+
+    class _Record:
+        def model_dump_json(self, indent=None):
+            return '{"id":"teleop-1","state":"running"}'
+
+    class _Manager:
+        def start(self, config):
+            captured["config"] = config
+            return _Record()
+
+    monkeypatch.setattr(alex_teleop, "teleop_manager", _Manager())
+
+    main(
+        [
+            "teleop",
+            "--teleop-device",
+            "gamepad",
+            "--num-envs",
+            "3",
+            "--sensitivity",
+            "2.0",
+            "--isaaclab-root",
+            "/opt/IsaacLab",
+        ]
+    )
+
+    config = captured["config"]
+    assert config.teleop_device == "gamepad"
+    assert config.num_envs == 3
+    assert config.sensitivity == 2.0
+    assert config.isaaclab_root == "/opt/IsaacLab"
+    assert capsys.readouterr().out.strip() == '{"id":"teleop-1","state":"running"}'
+
+
+def test_teleop_cli_status_logs_and_stop_use_manager(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import lelab.alex_teleop as alex_teleop
+    from lelab.scripts.lelab import main
+
+    calls: list[tuple[str, str]] = []
+
+    class _Record:
+        def __init__(self, state: str) -> None:
+            self.state = state
+
+        def model_dump_json(self, indent=None):
+            return f'{{"id":"teleop-1","state":"{self.state}"}}'
+
+    manager = SimpleNamespace(
+        get=lambda teleop_id: calls.append(("get", teleop_id)) or _Record("running"),
+        logs=lambda teleop_id: calls.append(("logs", teleop_id)) or "log text",
+        stop=lambda teleop_id: calls.append(("stop", teleop_id)) or _Record("stopped"),
+    )
+    monkeypatch.setattr(alex_teleop, "teleop_manager", manager)
+
+    main(["teleop-status", "teleop-1"])
+    main(["teleop-logs", "teleop-1"])
+    main(["teleop-stop", "teleop-1"])
+
+    output = capsys.readouterr().out
+    assert '{"id":"teleop-1","state":"running"}' in output
+    assert "log text" in output
+    assert '{"id":"teleop-1","state":"stopped"}' in output
+    assert calls == [("get", "teleop-1"), ("logs", "teleop-1"), ("stop", "teleop-1")]
+
+
+def test_train_command_cli_prints_lerobot_command(capsys: pytest.CaptureFixture[str]) -> None:
+    from lelab.scripts.lelab import main
+
+    main(
+        [
+            "train-command",
+            "--dataset-repo",
+            "owner/data",
+            "--model-repo",
+            "owner/model",
+            "--policy-type",
+            "groot",
+            "--dataset-episodes",
+            "14",
+            "15",
+            "--policy-base-model-path",
+            "nvidia/GR00T-N1.7-3B",
+            "--policy-embodiment-tag",
+            "alex_v2_ability_hands",
+            "--policy-chunk-size",
+            "16",
+            "--policy-n-action-steps",
+            "8",
+            "--output-dir",
+            "/outputs/alex",
+        ]
+    )
+
+    output = capsys.readouterr().out.strip()
+    assert output.startswith("python3 -m lerobot.scripts.lerobot_train ")
+    assert "--dataset.repo_id owner/data" in output
+    assert "--policy.repo_id owner/model" in output
+    assert "--dataset.episodes '[14, 15]'" in output
+    assert "--policy.base_model_path nvidia/GR00T-N1.7-3B" in output
+    assert "--policy.embodiment_tag alex_v2_ability_hands" in output
+    assert "--output_dir /outputs/alex" in output
+
+
+def test_train_command_cli_can_print_multi_gpu_bf16(capsys: pytest.CaptureFixture[str]) -> None:
+    from lelab.scripts.lelab import main
+
+    main(
+        [
+            "train-command",
+            "--dataset-repo",
+            "owner/data",
+            "--model-repo",
+            "owner/model",
+            "--policy-type",
+            "groot",
+            "--gpu-count",
+            "2",
+            "--policy-use-bf16",
+        ]
+    )
+
+    output = capsys.readouterr().out.strip()
+    assert output.startswith("accelerate launch --multi_gpu --num_processes 2 --mixed_precision bf16")
+    assert "--module lerobot.scripts.lerobot_train" in output
+    assert "--policy.use_bf16 true" in output
+
+
+def test_annotate_demos_cli_prints_minimal_arena_command(capsys: pytest.CaptureFixture[str]) -> None:
+    from lelab.scripts.lelab import main
+
+    main(
+        [
+            "annotate-demos",
+            "--input-file",
+            "/datasets/alex_lever_quest2_4s.hdf5",
+            "--output-file",
+            "/datasets/alex_lever_quest2_4s_mimic/annotated.hdf5",
+        ]
+    )
+
+    output = capsys.readouterr().out.strip()
+    assert output.startswith("ALEX_TELEOP_WRIST_STIFFNESS=800 ALEX_TELEOP_WRIST_DAMPING=50 ")
+    assert "/isaac-sim/python.sh isaaclab_arena/scripts/imitation_learning/annotate_demos.py" in output
+    assert "--mimic --input_file /datasets/alex_lever_quest2_4s.hdf5" in output
+    assert "alex_lever_turn --embodiment alex_v2_ability_hands" in output
+    assert "--lever_dr --lever_pose_dr_xy_jitter 0.08 --lever_pose_dr_yaw_jitter_deg 15.0" in output

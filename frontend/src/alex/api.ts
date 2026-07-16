@@ -158,6 +158,7 @@ export interface TrainingCapabilities {
 export interface LeRobotTrainingConfig {
   kind: "lerobot";
   dataset_repo_id: string;
+  dataset_episodes?: number[];
   model_repo_id: string;
   policy_type: string;
   policy_pretrained_path?: string;
@@ -214,6 +215,29 @@ export interface RolloutResult {
   policy_ref?: string;
 }
 
+export interface DatasetEvalRequest {
+  job_id?: string;
+  policy_ref?: string;
+  checkpoint: string;
+  dataset_repo_id?: string;
+  dataset_revision?: string;
+  dataset_episodes: number[];
+  gpu: string;
+  batch_size: number;
+  num_workers: number;
+  policy_use_bf16: boolean;
+}
+
+export interface DatasetEvalResult {
+  id: string;
+  status: string;
+  policy_ref: string;
+  dataset_repo_id: string;
+  metrics?: Record<string, number | string | number[]>;
+  error_message?: string;
+  error?: string;
+}
+
 export interface TeleopRequest {
   environment: string;
   teleop_device: "keyboard" | "spacemouse" | "gamepad" | "handtracking";
@@ -259,6 +283,14 @@ export const alexApi = {
   rolloutLogs: (id: string) => request<JobLogs>(`/alex/rollouts/${encodeURIComponent(id)}/logs`),
   stopRollout: (id: string) =>
     request<RolloutResult>(`/alex/rollouts/${encodeURIComponent(id)}/stop`, { method: "POST" }),
+  datasetEval: (body: DatasetEvalRequest) =>
+    request<DatasetEvalResult>("/alex/dataset-evals", { method: "POST", body: JSON.stringify(body) }),
+  datasetEvalStatus: (id: string) =>
+    request<DatasetEvalResult>(`/alex/dataset-evals/${encodeURIComponent(id)}`),
+  datasetEvalLogs: (id: string) =>
+    request<JobLogs>(`/alex/dataset-evals/${encodeURIComponent(id)}/logs`),
+  stopDatasetEval: (id: string) =>
+    request<DatasetEvalResult>(`/alex/dataset-evals/${encodeURIComponent(id)}/stop`, { method: "POST" }),
   teleop: (body: TeleopRequest) =>
     request<TeleopResult>("/alex/teleop", { method: "POST", body: JSON.stringify(body) }),
   teleopStatus: (id: string) => request<TeleopResult>(`/alex/teleop/${encodeURIComponent(id)}`),

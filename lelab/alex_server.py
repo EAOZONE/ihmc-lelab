@@ -19,6 +19,7 @@ from fastapi.staticfiles import StaticFiles
 from .alex_models import (
     DEFAULT_ISAACLAB_ROOT,
     DatasetConversionConfig,
+    DatasetEvalConfig,
     DatasetInspectRequest,
     EvaluationConfig,
     RemoteTrainingRequest,
@@ -29,6 +30,7 @@ from .alex_models import (
 from .alex_teleop import teleop_manager
 from .cluster import ClusterConnectRequest, HostKeyVerificationError, cluster_manager
 from .datasets import inspect_dataset, list_all_datasets
+from .dataset_eval import dataset_eval_manager
 from .evaluation import evaluation_manager
 from .policies import get_training_capabilities
 from .remote_jobs import remote_job_manager
@@ -88,6 +90,7 @@ def connect(body: ClusterConnectRequest) -> dict:
     try:
         status = cluster_manager.connect(body)
         remote_job_manager.reattach()
+        dataset_eval_manager.reattach()
         rollout_manager.reattach()
         return {**status, "user": status.get("username")}
     except HostKeyVerificationError as exc:
@@ -306,6 +309,60 @@ def _rollout_response(record) -> dict:
         **record.model_dump(),
         "status": "completed" if record.state == "done" else record.state,
     }
+
+
+def _dataset_eval_response(record) -> dict:
+    return {
+        **record.model_dump(),
+        "status": "completed" if record.state == "done" else record.state,
+        "error": record.error_message,
+    }
+
+
+@app.post("/alex/dataset-evals", status_code=201)
+def start_dataset_eval(body: DatasetEvalConfig) -> dict:
+    try:
+        return _dataset_eval_response(dataset_eval_manager.start(body))
+    except ConnectionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Dataset eval launch failed")
+        raise HTTPException(status_code=502, detail=f"Dataset eval launch failed: {exc}") from exc
+
+
+@app.get("/alex/dataset-evals/{eval_id}")
+def dataset_eval(eval_id: str) -> dict:
+    try:
+        return _dataset_eval_response(dataset_eval_manager.get(eval_id))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Dataset eval not found") from exc
+
+
+@app.get("/alex/dataset-evals/{eval_id}/logs")
+def dataset_eval_logs(eval_id: str, tail: int = 2000) -> dict:
+    try:
+        logs = (
+            dataset_eval_manager.logs(eval_id, tail)
+            if cluster_manager.status()["connected"]
+            else dataset_eval_manager.persisted_logs(eval_id)
+        )
+        return {"logs": logs}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Dataset eval not found") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Could not read dataset eval logs: {exc}") from exc
+
+
+@app.post("/alex/dataset-evals/{eval_id}/stop")
+def stop_dataset_eval(eval_id: str) -> dict:
+    try:
+        return _dataset_eval_response(dataset_eval_manager.stop(eval_id))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Dataset eval not found") from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.post("/alex/rollouts", status_code=201)

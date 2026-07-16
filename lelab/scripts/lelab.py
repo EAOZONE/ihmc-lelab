@@ -26,6 +26,7 @@ import argparse
 import contextlib
 import logging
 import os
+import shlex
 import shutil
 import signal
 import socket
@@ -495,10 +496,171 @@ def _build_parser() -> argparse.ArgumentParser:
     logs.add_argument("rollout_id")
     stop = commands.add_parser("rollout-stop", help="Stop a running rollout.")
     stop.add_argument("rollout_id")
+
+    teleop = commands.add_parser("teleop", help="Start a local Isaac Lab teleoperation session.")
+    teleop.add_argument("--environment", default="Isaac-Alex-Lever-Play-v0")
+    teleop.add_argument(
+        "--teleop-device",
+        choices=("keyboard", "spacemouse", "gamepad", "handtracking"),
+        default="keyboard",
+    )
+    teleop.add_argument("--num-envs", type=int, default=1)
+    teleop.add_argument("--sensitivity", type=float, default=1.0)
+    teleop.add_argument("--isaaclab-root", default="/home/bpratt/IsaacLab")
+
+    teleop_status = commands.add_parser("teleop-status", help="Show a teleop session record.")
+    teleop_status.add_argument("teleop_id")
+    teleop_logs = commands.add_parser("teleop-logs", help="Show teleop logs.")
+    teleop_logs.add_argument("teleop_id")
+    teleop_stop = commands.add_parser("teleop-stop", help="Stop a running teleop session.")
+    teleop_stop.add_argument("teleop_id")
+
+    train_command = commands.add_parser("train-command", help="Print the in-container LeRobot training command.")
+    train_command.add_argument("--dataset-repo", required=True)
+    train_command.add_argument("--model-repo", required=True)
+    train_command.add_argument("--policy-type", default="groot")
+    train_command.add_argument("--dataset-revision")
+    train_command.add_argument("--dataset-episodes", type=int, nargs="+")
+    train_command.add_argument("--policy-path")
+    train_command.add_argument("--policy-base-model-path")
+    train_command.add_argument("--policy-embodiment-tag")
+    train_command.add_argument("--policy-chunk-size", type=int)
+    train_command.add_argument("--policy-n-action-steps", type=int)
+    train_command.add_argument("--policy-use-relative-actions", action="store_true")
+    train_command.add_argument("--policy-relative-exclude-joints", nargs="+")
+    train_command.add_argument("--policy-use-bf16", action="store_true")
+    train_command.add_argument("--dataset-image-transforms-enable", action="store_true")
+    train_command.add_argument("--steps", type=int, default=10000)
+    train_command.add_argument("--batch-size", type=int, default=8)
+    train_command.add_argument("--num-workers", type=int, default=4)
+    train_command.add_argument("--seed", type=int, default=1000)
+    train_command.add_argument("--log-freq", type=int, default=250)
+    train_command.add_argument("--save-freq", type=int, default=1000)
+    train_command.add_argument("--no-save-checkpoint", action="store_true")
+    train_command.add_argument("--policy-use-amp", action="store_true")
+    train_command.add_argument("--wandb-enable", action="store_true")
+    train_command.add_argument("--wandb-project")
+    train_command.add_argument("--output-dir", default="/outputs/run")
+    train_command.add_argument("--gpu-count", type=int, default=1)
+
+    annotate = commands.add_parser("annotate-demos", help="Build or run Arena mimic demo annotation.")
+    annotate.add_argument("--input-file", required=True)
+    annotate.add_argument("--output-file", required=True)
+    annotate.add_argument("--environment", default="alex_lever_turn")
+    annotate.add_argument("--embodiment", default="alex_v2_ability_hands")
+    annotate.add_argument("--usd", default="isaaclab_arena/assets/lever_sim/another_try_lever.usd")
+    annotate.add_argument("--device", default="cuda")
+    annotate.add_argument("--viz", choices=("kit", "none"), default="kit")
+    annotate.add_argument("--no-mimic", action="store_true")
+    annotate.add_argument("--no-lever-dr", action="store_true")
+    annotate.add_argument("--lever-pose-dr-xy-jitter", type=float, default=0.08)
+    annotate.add_argument("--lever-pose-dr-yaw-jitter-deg", type=float, default=15.0)
+    annotate.add_argument("--success-angle-threshold", type=float, default=0.7853981633974483)
+    annotate.add_argument("--wrist-stiffness", type=int, default=800)
+    annotate.add_argument("--wrist-damping", type=int, default=50)
+    annotate.add_argument("--python-executable", default="/isaac-sim/python.sh")
+    annotate.add_argument("--arena-workdir", default="/workspaces/isaaclab_arena")
+    annotate.add_argument("--container", dest="container_name")
+    annotate.add_argument("--run", action="store_true", help="Run the command instead of printing it.")
     return parser
 
 
-def _run_rollout_command(args: argparse.Namespace) -> None:
+def _run_subcommand(args: argparse.Namespace) -> None:
+    if args.command == "annotate-demos":
+        from lelab.alex_models import (
+            DemoAnnotationConfig,
+            build_demo_annotation_command,
+            build_demo_annotation_env,
+        )
+
+        config = DemoAnnotationConfig(
+            input_file=args.input_file,
+            output_file=args.output_file,
+            environment=args.environment,
+            embodiment=args.embodiment,
+            usd=args.usd,
+            device=args.device,
+            viz=args.viz,
+            mimic=not args.no_mimic,
+            lever_dr=not args.no_lever_dr,
+            lever_pose_dr_xy_jitter=args.lever_pose_dr_xy_jitter,
+            lever_pose_dr_yaw_jitter_deg=args.lever_pose_dr_yaw_jitter_deg,
+            success_angle_threshold=args.success_angle_threshold,
+            wrist_stiffness=args.wrist_stiffness,
+            wrist_damping=args.wrist_damping,
+            python_executable=args.python_executable,
+            arena_workdir=args.arena_workdir,
+            container_name=args.container_name,
+        )
+        command = build_demo_annotation_command(config)
+        env_overrides = build_demo_annotation_env(config)
+        printable_env = {} if config.container_name else env_overrides
+        rendered = " ".join(
+            [*(f"{key}={shlex.quote(value)}" for key, value in printable_env.items()), *map(shlex.quote, command)]
+        )
+        print(rendered)
+        if args.run:
+            env = os.environ.copy()
+            env.update(env_overrides)
+            subprocess.run(command, cwd=None if config.container_name else config.arena_workdir, env=env, check=True)
+        return
+
+    if args.command in {"teleop", "teleop-status", "teleop-logs", "teleop-stop"}:
+        from lelab.alex_models import TeleopConfig
+        from lelab.alex_teleop import teleop_manager
+
+        if args.command == "teleop":
+            config = TeleopConfig(
+                environment=args.environment,
+                teleop_device=args.teleop_device,
+                num_envs=args.num_envs,
+                sensitivity=args.sensitivity,
+                isaaclab_root=args.isaaclab_root,
+            )
+            print(teleop_manager.start(config).model_dump_json(indent=2))
+            return
+        if args.command == "teleop-status":
+            print(teleop_manager.get(args.teleop_id).model_dump_json(indent=2))
+            return
+        if args.command == "teleop-logs":
+            print(teleop_manager.logs(args.teleop_id))
+            return
+        if args.command == "teleop-stop":
+            print(teleop_manager.stop(args.teleop_id).model_dump_json(indent=2))
+            return
+
+    if args.command == "train-command":
+        from lelab.alex_models import LeRobotTrainingConfig, build_lerobot_training_command
+
+        config = LeRobotTrainingConfig(
+            dataset_repo_id=args.dataset_repo,
+            dataset_revision=args.dataset_revision,
+            dataset_episodes=args.dataset_episodes,
+            model_repo_id=args.model_repo,
+            policy_type=args.policy_type,
+            policy_pretrained_path=args.policy_path,
+            steps=args.steps,
+            batch_size=args.batch_size,
+            seed=args.seed,
+            num_workers=args.num_workers,
+            log_freq=args.log_freq,
+            save_freq=args.save_freq,
+            save_checkpoint=not args.no_save_checkpoint,
+            policy_use_amp=args.policy_use_amp,
+            wandb_enable=args.wandb_enable,
+            wandb_project=args.wandb_project,
+            policy_base_model_path=args.policy_base_model_path,
+            policy_embodiment_tag=args.policy_embodiment_tag,
+            policy_chunk_size=args.policy_chunk_size,
+            policy_n_action_steps=args.policy_n_action_steps,
+            policy_use_relative_actions=True if args.policy_use_relative_actions else None,
+            policy_relative_exclude_joints=args.policy_relative_exclude_joints,
+            policy_use_bf16=True if args.policy_use_bf16 else None,
+            dataset_image_transforms_enable=args.dataset_image_transforms_enable,
+        )
+        print(shlex.join(build_lerobot_training_command(config, args.output_dir, args.gpu_count)))
+        return
+
     from lelab.alex_models import RolloutConfig
     from lelab.rollouts import rollout_manager
 
@@ -544,7 +706,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     if args.command:
-        _run_rollout_command(args)
+        _run_subcommand(args)
         return
 
     if args.stop:
