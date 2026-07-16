@@ -98,9 +98,26 @@ export interface AlexJob {
   started_at?: string | number;
   finished_at?: string | number;
   progress?: number;
+  metrics?: TrainingMetrics;
   gpus?: number[];
   config?: Record<string, unknown>;
   error?: string;
+}
+
+export interface TrainingMetrics {
+  current_step: number;
+  total_steps: number;
+  current_loss: number | null;
+  current_lr: number | null;
+  grad_norm: number | null;
+  eta_seconds: number | null;
+}
+
+export interface TrainingMetricPoint {
+  step: number;
+  loss: number | null;
+  lr: number | null;
+  grad_norm: number | null;
 }
 
 export interface JobLogs {
@@ -170,27 +187,44 @@ export interface TrainingRequest {
   config: LeRobotTrainingConfig;
 }
 
-export interface EvaluationRequest {
-  policy_type: string;
-  model_path: string;
-  meta_path?: string;
+export interface RolloutRequest {
+  target: "sim" | "arena" | "robot";
+  inference_location?: "remote" | "local";
+  job_id?: string;
+  policy_ref?: string;
+  checkpoint: string;
+  dataset_repo_id?: string;
+  gpu: string;
+  task: string;
   environment: string;
   embodiment: string;
+  usd?: string;
   num_episodes: number;
-  device: string;
-  policy_device: string;
   video: boolean;
   camera_video: boolean;
-  language_instruction?: string;
 }
 
-export interface EvaluationResult {
+export interface RolloutResult {
   id: string;
   status: string;
   metrics?: Record<string, number | string>;
-  output_path?: string;
-  message?: string;
   artifacts?: string[];
+  error_message?: string;
+  blockers?: string[];
+  policy_ref?: string;
+}
+
+export interface TeleopRequest {
+  environment: string;
+  teleop_device: "keyboard" | "spacemouse" | "gamepad" | "handtracking";
+  num_envs: number;
+  sensitivity: number;
+}
+
+export interface TeleopResult {
+  id: string;
+  status: string;
+  pid?: number;
   error_message?: string;
 }
 
@@ -213,14 +247,22 @@ export const alexApi = {
   jobs: () => request<AlexJob[]>("/alex/jobs"),
   job: (id: string) => request<AlexJob>(`/alex/jobs/${encodeURIComponent(id)}`),
   logs: (id: string) => request<JobLogs>(`/alex/jobs/${encodeURIComponent(id)}/logs`),
+  metricsHistory: (id: string) =>
+    request<{ points: TrainingMetricPoint[] }>(`/alex/jobs/${encodeURIComponent(id)}/metrics-history`),
   stopJob: (id: string) =>
     request<AlexJob>(`/alex/jobs/${encodeURIComponent(id)}/stop`, { method: "POST" }),
   train: (body: TrainingRequest) =>
     request<AlexJob>("/alex/training", { method: "POST", body: JSON.stringify(body) }),
-  evaluate: (body: EvaluationRequest) =>
-    request<EvaluationResult>("/alex/evaluations", { method: "POST", body: JSON.stringify(body) }),
-  evaluation: (id: string) => request<EvaluationResult>(`/alex/evaluations/${encodeURIComponent(id)}`),
-  evaluationLogs: (id: string) => request<JobLogs>(`/alex/evaluations/${encodeURIComponent(id)}/logs`),
-  stopEvaluation: (id: string) =>
-    request<EvaluationResult>(`/alex/evaluations/${encodeURIComponent(id)}/stop`, { method: "POST" }),
+  rollout: (body: RolloutRequest) =>
+    request<RolloutResult>("/alex/rollouts", { method: "POST", body: JSON.stringify(body) }),
+  rolloutStatus: (id: string) => request<RolloutResult>(`/alex/rollouts/${encodeURIComponent(id)}`),
+  rolloutLogs: (id: string) => request<JobLogs>(`/alex/rollouts/${encodeURIComponent(id)}/logs`),
+  stopRollout: (id: string) =>
+    request<RolloutResult>(`/alex/rollouts/${encodeURIComponent(id)}/stop`, { method: "POST" }),
+  teleop: (body: TeleopRequest) =>
+    request<TeleopResult>("/alex/teleop", { method: "POST", body: JSON.stringify(body) }),
+  teleopStatus: (id: string) => request<TeleopResult>(`/alex/teleop/${encodeURIComponent(id)}`),
+  teleopLogs: (id: string) => request<JobLogs>(`/alex/teleop/${encodeURIComponent(id)}/logs`),
+  stopTeleop: (id: string) =>
+    request<TeleopResult>(`/alex/teleop/${encodeURIComponent(id)}/stop`, { method: "POST" }),
 };

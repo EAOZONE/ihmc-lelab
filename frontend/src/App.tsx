@@ -4,6 +4,7 @@ import { AlexLayout } from "@/alex/AlexLayout";
 import Dashboard from "@/alex/Dashboard";
 import Datasets from "@/alex/Datasets";
 import Evaluation from "@/alex/Evaluation";
+import Teleop from "@/alex/Teleop";
 import Training from "@/alex/Training";
 import TrainingJob from "@/alex/TrainingJob";
 
@@ -21,6 +22,7 @@ function App() {
             <Route path="/training" element={<Training />} />
             <Route path="/training/:jobId" element={<TrainingJob />} />
             <Route path="/evaluation" element={<Evaluation />} />
+            <Route path="/teleop" element={<Teleop />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
         </AlexLayout>
