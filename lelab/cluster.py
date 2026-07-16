@@ -6,7 +6,10 @@ import base64
 import csv
 import hashlib
 import io
+import logging
+import select
 import shlex
+import socket
 import threading
 from typing import Any
 
@@ -22,6 +25,7 @@ GPU_QUERY_COMMAND = f"nvidia-smi --query-gpu={GPU_QUERY_FIELDS} --format=csv,noh
 PROCESS_QUERY_COMMAND = (
     "nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_gpu_memory --format=csv,noheader,nounits"
 )
+logger = logging.getLogger(__name__)
 
 
 class ClusterConnectRequest(BaseModel):
@@ -35,6 +39,66 @@ class ClusterConnectRequest(BaseModel):
 
 class HostKeyVerificationError(RuntimeError):
     pass
+
+
+class SshTunnel:
+    """Small loopback-only local forward over an existing Paramiko transport."""
+
+    def __init__(self, transport: paramiko.Transport, remote_host: str, remote_port: int) -> None:
+        self._transport = transport
+        self._remote = (remote_host, remote_port)
+        self._stop = threading.Event()
+        self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._listener.bind(("127.0.0.1", 0))
+        self._listener.listen(8)
+        self._listener.settimeout(0.5)
+        self.local_port = int(self._listener.getsockname()[1])
+        self._thread = threading.Thread(target=self._accept, name="alex-ssh-forward", daemon=True)
+        self._thread.start()
+
+    def _accept(self) -> None:
+        while not self._stop.is_set():
+            try:
+                client, address = self._listener.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                break
+            threading.Thread(target=self._bridge, args=(client, address), daemon=True).start()
+
+    def _bridge(self, client: socket.socket, address: tuple[str, int]) -> None:
+        channel = None
+        try:
+            try:
+                channel = self._transport.open_channel("direct-tcpip", self._remote, address)
+            except paramiko.SSHException as exc:
+                # This commonly happens during readiness polling while the
+                # remote policy server container is still starting or has
+                # already failed. The caller owns the timeout and diagnostics;
+                # avoid one traceback per poll attempt.
+                logger.debug("SSH tunnel could not connect to %s:%s: %s", *self._remote, exc)
+                return
+            if channel is None:
+                return
+            while not self._stop.is_set():
+                readable, _, _ = select.select([client, channel], [], [], 0.5)
+                for source in readable:
+                    data = source.recv(1024 * 1024)
+                    if not data:
+                        return
+                    (channel if source is client else client).sendall(data)
+                if channel.closed:
+                    break
+        finally:
+            client.close()
+            if channel is not None:
+                channel.close()
+
+    def close(self) -> None:
+        self._stop.set()
+        self._listener.close()
+        self._thread.join(timeout=2)
 
 
 def sha256_fingerprint(key: paramiko.PKey) -> str:
@@ -197,6 +261,14 @@ class ClusterManager:
         exit_code = stdout.channel.recv_exit_status()
         return exit_code, stdout.read().decode("utf-8", "replace"), stderr.read().decode("utf-8", "replace")
 
+    def forward_remote_port(self, remote_port: int, remote_host: str = "127.0.0.1") -> SshTunnel:
+        """Forward an ephemeral local loopback port to the connected host."""
+        with self._lock:
+            transport = self._client.get_transport() if self._client is not None else None
+        if transport is None or not transport.is_active():
+            raise ConnectionError("cluster is not connected")
+        return SshTunnel(transport, remote_host, remote_port)
+
     def gpus(self) -> list[dict[str, Any]]:
         code, stdout, stderr = self.execute(GPU_QUERY_COMMAND)
         if code:
@@ -216,6 +288,10 @@ class ClusterManager:
             "nvidia_container_runtime": "docker info --format '{{json .Runtimes}}' | grep -q nvidia",
             "training_image": (
                 f"docker image inspect {shlex.quote(remote_training_image())} >/dev/null 2>&1"
+            ),
+            "rollout_runtime": (
+                f"docker run --rm {shlex.quote(remote_training_image())} "
+                "test -f /opt/alex/alex_policy_server.py"
             ),
             "huggingface_login": remote_hf_token_prelude() + "true",
             "writable_home": 'test -w "$HOME"',

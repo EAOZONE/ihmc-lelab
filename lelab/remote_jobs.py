@@ -12,10 +12,11 @@ import uuid
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .alex_models import LeRobotTrainingConfig, RemoteTrainingRequest, build_lerobot_training_command
 from .cluster import ClusterManager, cluster_manager
+from .jobs import MetricsHistoryPoint, TrainingMetrics, parse_metrics_into
 
 RemoteJobState = Literal["running", "done", "failed", "stopped", "unknown"]
 _CONTAINER_SAFE = re.compile(r"[^a-z0-9_.-]+")
@@ -36,7 +37,27 @@ class RemoteJobRecord(BaseModel):
     exit_code: int | None = None
     error_message: str | None = None
     log_path: str
+    metrics: TrainingMetrics = Field(default_factory=TrainingMetrics)
     runner: Literal["ssh_docker"] = "ssh_docker"
+
+
+def parse_remote_metrics_history(logs: str) -> list[MetricsHistoryPoint]:
+    """Extract the durable LeRobot loss/lr series from Docker output."""
+    by_step: dict[int, MetricsHistoryPoint] = {}
+    for line in logs.splitlines():
+        if "step:" not in line or "loss:" not in line:
+            continue
+        metrics = TrainingMetrics()
+        parse_metrics_into(line, metrics)
+        if metrics.current_step <= 0:
+            continue
+        by_step[metrics.current_step] = MetricsHistoryPoint(
+            step=metrics.current_step,
+            loss=metrics.current_loss,
+            lr=metrics.current_lr,
+            grad_norm=metrics.grad_norm,
+        )
+    return [by_step[step] for step in sorted(by_step)]
 
 
 def build_remote_docker_command(
@@ -67,10 +88,33 @@ def build_remote_docker_command(
         f"alex.job_id={job_id}",
     ]
     output_dir = "/outputs/run"
-    argv += ["--env", "HF_TOKEN", "--env", "HF_HOME=/cache/huggingface"]
+    video_tolerance_s = os.environ.get("ALEX_VIDEO_TIMESTAMP_TOLERANCE_S", "0.012")
+    argv += [
+        "--env",
+        "HF_TOKEN",
+        "--env",
+        "HF_HOME=/cache/huggingface",
+        "--env",
+        f"ALEX_VIDEO_TIMESTAMP_TOLERANCE_S={video_tolerance_s}",
+    ]
     argv += ["--volume", "alex_hf_cache:/cache/huggingface"]
     argv += ["--volume", f"alex_{job_id}_checkpoints:/outputs"]
     argv.append(image or remote_training_image())
+    manifest = {
+        "version": 1,
+        "dataset_repo_id": config.dataset_repo_id,
+        "dataset_revision": config.dataset_revision,
+        "model_repo_id": config.model_repo_id,
+        "policy_type": config.policy_type,
+        "target_profile": "alex_v2_ability_hands",
+    }
+    argv += [
+        "python3",
+        "/opt/alex/alex_train_with_manifest.py",
+        "--manifest",
+        json.dumps(manifest, separators=(",", ":")),
+        "--",
+    ]
     argv += build_lerobot_training_command(config, output_dir, len(gpu_uuids))
     launch = shlex.join(argv)
     return with_remote_hf_token(launch)
@@ -124,6 +168,9 @@ class RemoteJobManager:
 
     def _log_path(self, job_id: str) -> Path:
         return self.root / job_id / "docker.log"
+
+    def _metrics_path(self, job_id: str) -> Path:
+        return self.root / job_id / "metrics.json"
 
     def _persist(self, record: RemoteJobRecord) -> None:
         path = self._record_path(record.id)
@@ -247,12 +294,41 @@ class RemoteJobManager:
         path = Path(record.log_path)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(logs)
+        for line in logs.splitlines():
+            parse_metrics_into(line, record.metrics)
+        self._persist(record)
         return logs
 
     def persisted_logs(self, job_id: str) -> str:
         record = self.get(job_id, refresh=False)
         path = Path(record.log_path)
         return path.read_text() if path.is_file() else ""
+
+    def metrics_history(self, job_id: str) -> list[MetricsHistoryPoint]:
+        """Return loss/lr history, refreshing the persisted Docker log when possible."""
+        self.get(job_id, refresh=False)
+        path = self._metrics_path(job_id)
+        cached: list[MetricsHistoryPoint] = []
+        if path.is_file():
+            try:
+                cached = [MetricsHistoryPoint.model_validate(item) for item in json.loads(path.read_text())]
+            except (OSError, ValueError, TypeError):
+                cached = []
+        if self.cluster.status()["connected"]:
+            logs = self.logs(job_id, tail=10000)
+            fresh = parse_remote_metrics_history(logs)
+            merged = {point.step: point for point in cached}
+            merged.update({point.step: point for point in fresh})
+            points = [merged[step] for step in sorted(merged)][-2000:]
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temp = path.with_suffix(".tmp")
+            temp.write_text(json.dumps([point.model_dump() for point in points]))
+            os.replace(temp, path)
+            return points
+        if cached:
+            return cached[-2000:]
+        logs = self.persisted_logs(job_id)
+        return parse_remote_metrics_history(logs)[-2000:]
 
     def stop(self, job_id: str) -> RemoteJobRecord:
         record = self.get(job_id, refresh=False)

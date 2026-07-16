@@ -1,4 +1,4 @@
-import { Boxes, ChartNoAxesCombined, Database, FlaskConical, LayoutDashboard, Menu, X } from "lucide-react";
+import { Boxes, ChartNoAxesCombined, Database, FlaskConical, Gamepad2, LayoutDashboard, Menu, X } from "lucide-react";
 import { useState, type ReactNode } from "react";
 import { NavLink } from "react-router-dom";
 import { cn } from "@/lib/utils";
@@ -8,6 +8,7 @@ const navigation = [
   { to: "/datasets", label: "Datasets", icon: Database },
   { to: "/training", label: "Training", icon: ChartNoAxesCombined },
   { to: "/evaluation", label: "Evaluation", icon: FlaskConical },
+  { to: "/teleop", label: "Teleop", icon: Gamepad2 },
 ];
 
 export function AlexLayout({ children }: { children: ReactNode }) {

@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Activity, ArrowRight, CheckCircle2, CircleOff, Cpu, Database, Loader2, Server, Unplug } from "lucide-react";
+import { Activity, ArrowRight, CheckCircle2, CircleOff, Cpu, Database, Gamepad2, Loader2, Server, Unplug } from "lucide-react";
 import { useState } from "react";
 import { Link } from "react-router-dom";
 import { alexApi } from "./api";
@@ -68,7 +68,8 @@ export default function Dashboard() {
           <div className="mt-5 space-y-3">
             <WorkflowLink to="/datasets" icon={Database} title="Prepare a dataset" detail="Inspect and convert robot data" />
             <WorkflowLink to="/training" icon={Cpu} title="Launch training" detail="Any available LeRobot policy across GPUs 0–6" />
-            <WorkflowLink to="/evaluation" icon={Activity} title="Evaluate checkpoint" detail="Measure policy performance" />
+            <WorkflowLink to="/evaluation" icon={Activity} title="Run a policy" detail="Roll out in Isaac Lab/Sim or inspect Alex readiness" />
+            <WorkflowLink to="/teleop" icon={Gamepad2} title="Teleoperate Alex" detail="Drive the sim directly in Isaac Lab" />
           </div>
         </Panel>
       </div>

@@ -55,9 +55,7 @@ def test_optional_dataset_fields_only_present_when_set() -> None:
     cmd2 = build_training_command(req2, "/tmp/out")
     assert _arg_value(cmd2, "--dataset.revision") == "v2"
     assert _arg_value(cmd2, "--dataset.root") == "/data"
-    # `--dataset.episodes` is followed by 3 string-encoded ints.
-    idx = cmd2.index("--dataset.episodes")
-    assert cmd2[idx + 1 : idx + 4] == ["0", "1", "2"]
+    assert _arg_value(cmd2, "--dataset.episodes") == "[0, 1, 2]"
 
 
 def test_wandb_block_only_serialized_when_enabled() -> None:

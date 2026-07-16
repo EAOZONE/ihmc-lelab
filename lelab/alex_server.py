@@ -17,17 +17,24 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from .alex_models import (
+    DEFAULT_ISAACLAB_ROOT,
     DatasetConversionConfig,
+    DatasetEvalConfig,
     DatasetInspectRequest,
     EvaluationConfig,
     RemoteTrainingRequest,
+    RolloutConfig,
+    TeleopConfig,
     build_dataset_conversion_command,
 )
+from .alex_teleop import teleop_manager
 from .cluster import ClusterConnectRequest, HostKeyVerificationError, cluster_manager
 from .datasets import inspect_dataset, list_all_datasets
+from .dataset_eval import dataset_eval_manager
 from .evaluation import evaluation_manager
 from .policies import get_training_capabilities
 from .remote_jobs import remote_job_manager
+from .rollouts import rollout_manager
 
 logger = logging.getLogger(__name__)
 app = FastAPI(title="Alex Lab", version="0.1.0")
@@ -53,22 +60,24 @@ def health() -> dict[str, str]:
 
 
 @app.get("/alex/setup")
-def setup(arena_root: str = "/home/bpratt/IsaacLab-Arena") -> dict:
+def setup(
+    arena_root: str = "/home/bpratt/IsaacLab-Arena",
+    isaaclab_root: str = str(DEFAULT_ISAACLAB_ROOT),
+) -> dict:
     root = Path(arena_root).expanduser()
+    sim_root = Path(isaaclab_root).expanduser()
     local = {
+        "isaaclab_root": sim_root.is_dir(),
+        "isaaclab_launcher": (sim_root / "isaaclab.sh").is_file(),
         "arena_root": root.is_dir(),
-        "evaluation_runner": (root / "isaaclab_arena/evaluation/policy_runner.py").is_file(),
-        "gr00t_converter": (
-            root / "isaaclab_arena_gr00t/lerobot/convert_lerobot_v3_to_gr00t.py"
-        ).is_file(),
-        "ccil_converter": (
-            root / "isaaclab_arena_ccil/data/convert_lerobot_to_ccil.py"
-        ).is_file(),
+        "gr00t_converter": (root / "isaaclab_arena_gr00t/lerobot/convert_lerobot_v3_to_gr00t.py").is_file(),
+        "ccil_converter": (root / "isaaclab_arena_ccil/data/convert_lerobot_to_ccil.py").is_file(),
     }
     cluster = cluster_manager.status()
     remote = cluster_manager.setup_checks() if cluster["connected"] else None
     return {
         "ready": bool(remote and remote["ready"]),
+        "isaaclab_root": str(sim_root),
         "arena_root": str(root),
         "local": local,
         "cluster": cluster,
@@ -81,6 +90,8 @@ def connect(body: ClusterConnectRequest) -> dict:
     try:
         status = cluster_manager.connect(body)
         remote_job_manager.reattach()
+        dataset_eval_manager.reattach()
+        rollout_manager.reattach()
         return {**status, "user": status.get("username")}
     except HostKeyVerificationError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -168,8 +179,7 @@ async def dataset_convert(request: Request) -> dict:
             }
             if format_name == "gr00t":
                 converted["modality_template"] = raw.get("modality_template") or str(
-                    root
-                    / "isaaclab_arena_gr00t/embodiments/alex/alex_test_obs_new_modality.json"
+                    root / "isaaclab_arena_gr00t/embodiments/alex/alex_test_obs_new_modality.json"
                 )
             body = DatasetConversionConfig.model_validate(converted)
         else:
@@ -189,6 +199,8 @@ async def dataset_convert(request: Request) -> dict:
 
 def _job_response(record) -> dict:
     state_map = {"done": "completed", "unknown": "queued"}
+    total_steps = int(record.config.get("steps") or 0)
+    progress = min(100.0, 100.0 * record.metrics.current_step / total_steps) if total_steps > 0 else None
     return {
         **record.model_dump(),
         "method": "groot" if record.kind == "gr00t" else record.kind,
@@ -197,6 +209,7 @@ def _job_response(record) -> dict:
         "error": record.error_message,
         "created_at": record.started_at,
         "finished_at": record.ended_at,
+        "progress": progress,
     }
 
 
@@ -271,12 +284,176 @@ def job_logs(job_id: str, tail: int = 2000) -> dict:
         raise HTTPException(status_code=502, detail=f"Could not read logs: {exc}") from exc
 
 
+@app.get("/alex/jobs/{job_id}/metrics-history")
+def job_metrics_history(job_id: str) -> dict:
+    try:
+        return {"points": [point.model_dump() for point in remote_job_manager.metrics_history(job_id)]}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Training job not found") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Could not read training metrics: {exc}") from exc
+
+
 @app.post("/alex/jobs/{job_id}/stop")
 def stop_job(job_id: str) -> dict:
     try:
         return _job_response(remote_job_manager.stop(job_id))
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Training job not found") from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+def _rollout_response(record) -> dict:
+    return {
+        **record.model_dump(),
+        "status": "completed" if record.state == "done" else record.state,
+    }
+
+
+def _dataset_eval_response(record) -> dict:
+    return {
+        **record.model_dump(),
+        "status": "completed" if record.state == "done" else record.state,
+        "error": record.error_message,
+    }
+
+
+@app.post("/alex/dataset-evals", status_code=201)
+def start_dataset_eval(body: DatasetEvalConfig) -> dict:
+    try:
+        return _dataset_eval_response(dataset_eval_manager.start(body))
+    except ConnectionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Dataset eval launch failed")
+        raise HTTPException(status_code=502, detail=f"Dataset eval launch failed: {exc}") from exc
+
+
+@app.get("/alex/dataset-evals/{eval_id}")
+def dataset_eval(eval_id: str) -> dict:
+    try:
+        return _dataset_eval_response(dataset_eval_manager.get(eval_id))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Dataset eval not found") from exc
+
+
+@app.get("/alex/dataset-evals/{eval_id}/logs")
+def dataset_eval_logs(eval_id: str, tail: int = 2000) -> dict:
+    try:
+        logs = (
+            dataset_eval_manager.logs(eval_id, tail)
+            if cluster_manager.status()["connected"]
+            else dataset_eval_manager.persisted_logs(eval_id)
+        )
+        return {"logs": logs}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Dataset eval not found") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Could not read dataset eval logs: {exc}") from exc
+
+
+@app.post("/alex/dataset-evals/{eval_id}/stop")
+def stop_dataset_eval(eval_id: str) -> dict:
+    try:
+        return _dataset_eval_response(dataset_eval_manager.stop(eval_id))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Dataset eval not found") from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/alex/rollouts", status_code=201)
+def start_rollout(body: RolloutConfig) -> dict:
+    try:
+        return _rollout_response(rollout_manager.start(body))
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ConnectionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Rollout launch failed")
+        raise HTTPException(status_code=502, detail=f"Rollout launch failed: {exc}") from exc
+
+
+@app.get("/alex/rollouts")
+def rollouts() -> dict:
+    return {"rollouts": [_rollout_response(item) for item in rollout_manager.list()]}
+
+
+@app.get("/alex/rollouts/{rollout_id}")
+def rollout(rollout_id: str) -> dict:
+    try:
+        return _rollout_response(rollout_manager.get(rollout_id))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Rollout not found") from exc
+
+
+@app.get("/alex/rollouts/{rollout_id}/logs")
+def rollout_logs(rollout_id: str) -> dict:
+    try:
+        return {"logs": rollout_manager.logs(rollout_id)}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Rollout not found") from exc
+
+
+@app.post("/alex/rollouts/{rollout_id}/stop")
+def stop_rollout(rollout_id: str) -> dict:
+    try:
+        return _rollout_response(rollout_manager.stop(rollout_id))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Rollout not found") from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+def _teleop_response(record) -> dict:
+    return {
+        **record.model_dump(),
+        "status": "completed" if record.state == "done" else record.state,
+    }
+
+
+@app.post("/alex/teleop", status_code=201)
+def start_teleop(body: TeleopConfig) -> dict:
+    try:
+        return _teleop_response(teleop_manager.start(body))
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Teleop launch failed")
+        raise HTTPException(status_code=502, detail=f"Teleop launch failed: {exc}") from exc
+
+
+@app.get("/alex/teleop")
+def teleop_sessions() -> dict:
+    return {"sessions": [_teleop_response(record) for record in teleop_manager.list()]}
+
+
+@app.get("/alex/teleop/{teleop_id}")
+def teleop_session(teleop_id: str) -> dict:
+    try:
+        return _teleop_response(teleop_manager.get(teleop_id))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Teleop session not found") from exc
+
+
+@app.get("/alex/teleop/{teleop_id}/logs")
+def teleop_logs(teleop_id: str) -> dict:
+    try:
+        return {"logs": teleop_manager.logs(teleop_id)}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Teleop session not found") from exc
+
+
+@app.post("/alex/teleop/{teleop_id}/stop")
+def stop_teleop(teleop_id: str) -> dict:
+    try:
+        return _teleop_response(teleop_manager.stop(teleop_id))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Teleop session not found") from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 

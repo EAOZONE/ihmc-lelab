@@ -2,9 +2,10 @@
 
 Alex Lab is a local web interface for Alex humanoid learning workflows. It
 provides dataset inspection and conversion, multi-policy LeRobot training, live
-multi-GPU cluster telemetry, durable remote jobs, and Isaac Lab-Arena
-simulation evaluation. Teleoperation and real-robot deployment are
-intentionally outside this version.
+multi-GPU cluster telemetry, durable remote jobs, and unified policy rollout to
+Isaac Lab/Isaac Sim. Physical Alex deployment is represented by the same workflow
+but remains motion-gated until the authoritative IHMC state, frame-transform,
+complete actuation, and watchdog providers are configured.
 
 The app is derived from LeLab's FastAPI/React architecture and is intended for
 one operator on `localhost`.
@@ -14,8 +15,8 @@ one operator on `localhost`.
 Local machine:
 
 - Linux, Python 3.12+, Node.js, and npm
-- `/home/bpratt/IsaacLab-Arena` for conversion and simulation evaluation
-- Docker and the NVIDIA Container Toolkit for local Isaac Lab-Arena evaluation
+- `/home/bpratt/IsaacLab` for local Isaac Lab/Isaac Sim rollout
+- `/home/bpratt/IsaacLab-Arena` for legacy dataset conversion helpers
 
 Remote training host:
 
@@ -63,6 +64,24 @@ passwords and Hugging Face tokens are never written to Alex Lab job records.
 After an Alex Lab restart, reconnect to resume monitoring surviving named
 containers.
 
+## Captury sim demos → Hub → train
+
+For **Captury teleop in Isaac Lab-Arena** (lever on `alex_empty`), HDF5 → LeRobot
+conversion, Hugging Face upload, and training/rollout in this app, see
+[`docs/CAPTURY_TO_LEROBOT_TRAINING.md`](docs/CAPTURY_TO_LEROBOT_TRAINING.md).
+
+## Repo-owned boundary
+
+Alex Lab is the single operator entry point, but it only owns the orchestration
+code that needs to live here:
+
+| Workflow | This repo owns | External implementation |
+|---|---|---|
+| Teleop | `TeleopConfig`, `build_isaaclab_teleop_command`, `TeleopManager`, `alexlab teleop` | Isaac Lab task/device scripts |
+| Mimic annotation | `DemoAnnotationConfig`, `build_demo_annotation_command`, `alexlab annotate-demos` | IsaacLab-Arena `annotate_demos.py`, mimic logic, USD/task setup |
+| Training | LeRobot request schemas, compatibility checks, remote Docker/HF launch, `alexlab train-command` | LeRobot trainer and policy code |
+| Rollout | Policy source resolution, policy server launch, rollout manifests, `alexlab rollout` | Isaac Lab runner, Arena `policy_runner.py`, LeRobot policy server |
+
 ## Training
 
 The Training page refreshes GPU utilization, memory, temperature, power, and
@@ -75,8 +94,8 @@ Build the training image on the remote host before connecting Alex Lab:
 
 ```bash
 cd /home/bpratt/leLab_for_alex
-docker build --pull -f Dockerfile.alex-training -t bpratt/alex-lerobot-train:0.6.0 .
-docker run --rm --gpus all bpratt/alex-lerobot-train:0.6.0 \
+docker build --pull -f Dockerfile.alex-training -t alex-lerobot-train:0.6.0 .
+docker run --rm --gpus all alex-lerobot-train:0.6.0 \
   python3 -c 'import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())'
 ```
 
@@ -101,13 +120,68 @@ by Alex Lab are displayed as occupied and are never terminated.
 GR00T uses LeRobot's standard GR00T N1.7 policy integration. Legacy CCIL and
 custom GR00T jobs remain visible in job history but cannot be launched.
 
-## Evaluation
+To inspect the exact in-container LeRobot command without starting a remote job:
 
-Evaluation wraps `isaaclab_arena/evaluation/policy_runner.py` and supports Alex
-task/embodiment selection, CCIL or GR00T checkpoints, episode counts,
-instructions, recorded viewport/camera videos, and optional poke robustness
-tests. Evaluation runs through the local Isaac Lab-Arena environment, so its
-model and dataset mounts must be available locally.
+```bash
+alexlab train-command --dataset-repo <owner/dataset> --model-repo <owner/model> \
+  --policy-type groot --policy-base-model-path nvidia/GR00T-N1.7-3B
+```
+
+## Rollout
+
+Rollout loads a schema-compatible LeRobot checkpoint on one GPU of the connected
+training host and forwards its typed observation/action protocol through the
+existing authenticated SSH connection. Isaac Lab/Isaac Sim runs locally and
+owns the Alex simulator state, episode metrics, and viewport/camera videos.
+
+## Teleop
+
+Alex Lab owns the thin launcher for local Isaac Lab teleoperation; Isaac Lab
+still owns the simulator, task registration, viewer, and device implementation.
+
+```bash
+alexlab teleop --environment Isaac-Alex-Lever-Play-v0 --teleop-device keyboard
+alexlab teleop-status <teleop-id>
+alexlab teleop-logs <teleop-id>
+alexlab teleop-stop <teleop-id>
+```
+
+From the UI, open **Rollout** and select a completed training job. The equivalent
+CLI is:
+
+```bash
+alexlab rollout --target sim --job <job-id> --checkpoint latest \
+  --environment Isaac-Alex-Lever-Play-v0 --episodes 20 --camera-video
+alexlab rollout-status <rollout-id>
+alexlab rollout-logs <rollout-id>
+alexlab rollout-stop <rollout-id>
+```
+
+Direct local or Hub policies use `--policy`; pass `--dataset-repo` when the
+checkpoint does not contain `lelab_rollout.json`. Training uploads this manifest
+to the model root and each saved checkpoint. Compatibility is based on the saved
+feature schema, not merely the policy class.
+
+To have IsaacLab-Arena open locally while the model is downloaded and served by
+the local Docker policy server, use a direct Hub ref with `--local-inference` and
+`--show`:
+
+```bash
+alexlab rollout --target arena --policy <owner/model> --checkpoint latest \
+  --dataset-repo <owner/dataset> --local-inference --show \
+  --environment alex_empty --usd isaaclab_arena/assets/lever_sim/LEVER_AGAIN.usd \
+  --task "Turn the lever"
+```
+
+For a LeLab-trained model, the policy server resolves `<owner/model>@latest` to
+the newest Hub checkpoint and caches the downloaded weights in the
+`alex_hf_cache` Docker volume. Omit `--dataset-repo` when the model already has
+`lelab_rollout.json`.
+
+`--target robot` currently performs the physical-Alex readiness audit and exits
+without motion unless all required capability providers are installed. The old
+send-only wrist UDP bridge is deliberately not accepted as a complete hardware
+target.
 
 ## Storage and recovery
 

@@ -41,6 +41,7 @@ from . import datasets as dataset_browser
 from .alex_models import (
     DatasetConversionConfig,
     DatasetInspectRequest,
+    DEFAULT_ISAACLAB_ROOT,
     EvaluationConfig,
     RemoteTrainingRequest,
     build_dataset_conversion_command,
@@ -411,12 +412,14 @@ def datasets_list():
 
 
 @app.get("/alex/setup")
-def alex_setup(arena_root: str = "/home/bpratt/IsaacLab-Arena"):
-    """Report local Arena files and, when connected, remote Docker readiness."""
+def alex_setup(arena_root: str = "/home/bpratt/IsaacLab-Arena", isaaclab_root: str = str(DEFAULT_ISAACLAB_ROOT)):
+    """Report local Isaac Lab/Arena files and, when connected, remote Docker readiness."""
     root = Path(arena_root).expanduser()
+    sim_root = Path(isaaclab_root).expanduser()
     local_checks = {
+        "isaaclab_root": sim_root.is_dir(),
+        "isaaclab_launcher": (sim_root / "isaaclab.sh").is_file(),
         "arena_root": root.is_dir(),
-        "evaluation_runner": (root / "isaaclab_arena/evaluation/policy_runner.py").is_file(),
         "gr00t_converter": (
             root / "isaaclab_arena_gr00t/lerobot/convert_lerobot_v3_to_gr00t.py"
         ).is_file(),
@@ -428,6 +431,7 @@ def alex_setup(arena_root: str = "/home/bpratt/IsaacLab-Arena"):
     remote = cluster_manager.setup_checks(arena_root) if cluster["connected"] else None
     return {
         "ready": all(local_checks.values()) and (remote is None or remote["ready"]),
+        "isaaclab_root": str(sim_root),
         "arena_root": str(root),
         "local": local_checks,
         "cluster": cluster,

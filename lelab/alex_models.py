@@ -2,17 +2,33 @@
 
 from __future__ import annotations
 
+import json
 import re
 import shlex
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 DEFAULT_ARENA_ROOT = Path("/home/bpratt/IsaacLab-Arena")
+DEFAULT_ISAACLAB_ROOT = Path("/home/bpratt/IsaacLab")
 _SAFE_IMAGE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:@-]*$")
 _SAFE_POLICY = re.compile(r"^[a-z][a-z0-9_]*$")
 _HUB_REPO = re.compile(r"^[^\s/]+/[^\s/]+$")
+
+_ALEX_TEST_OBS_NEW_STATE_DIM = 48
+_ALEX_TEST_OBS_NEW_ACTION_DIM = 46
+_ALEX_TEST_OBS_NEW_REPOS = {"H2Ozone/test_obs_new"}
+_MAX_DIM_POLICY_TYPES = {
+    "eo1",
+    "evo1",
+    "pi0",
+    "pi05",
+    "pi0_fast",
+    "smolvla",
+    "wall_x",
+    "xvla",
+}
 
 
 class DatasetInspectRequest(BaseModel):
@@ -53,6 +69,36 @@ class DatasetConversionConfig(BaseModel):
         if self.action_from_state_dims and not re.fullmatch(r"\d+:\d+", self.action_from_state_dims):
             raise ValueError("action_from_state_dims must have start:end form")
         return self
+
+
+class DemoAnnotationConfig(BaseModel):
+    """Arena HDF5 demo annotation using the existing IsaacLab-Arena script."""
+
+    input_file: str
+    output_file: str
+    environment: str = "alex_lever_turn"
+    embodiment: str = "alex_v2_ability_hands"
+    usd: str = "isaaclab_arena/assets/lever_sim/another_try_lever.usd"
+    device: str = "cuda"
+    viz: Literal["kit", "none"] = "kit"
+    mimic: bool = True
+    lever_dr: bool = True
+    lever_pose_dr_xy_jitter: float | None = 0.08
+    lever_pose_dr_yaw_jitter_deg: float | None = 15.0
+    success_angle_threshold: float | None = 0.7853981633974483
+    wrist_stiffness: int | None = 800
+    wrist_damping: int | None = 50
+    arena_workdir: str = "/workspaces/isaaclab_arena"
+    python_executable: str = "/isaac-sim/python.sh"
+    container_name: str | None = None
+
+    @field_validator("device")
+    @classmethod
+    def non_empty_device(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("device cannot be empty")
+        return value
 
 
 class GR00TTrainingConfig(BaseModel):
@@ -116,6 +162,7 @@ class LeRobotTrainingConfig(BaseModel):
     kind: Literal["lerobot"] = "lerobot"
     dataset_repo_id: str
     dataset_revision: str | None = None
+    dataset_episodes: list[int] | None = None
     model_repo_id: str
     policy_type: str = "act"
     policy_pretrained_path: str | None = None
@@ -158,6 +205,17 @@ class LeRobotTrainingConfig(BaseModel):
             raise ValueError("invalid policy type")
         return value
 
+    @field_validator("dataset_episodes")
+    @classmethod
+    def valid_dataset_episodes(cls, value: list[int] | None) -> list[int] | None:
+        if value is None:
+            return value
+        if any(episode < 0 for episode in value):
+            raise ValueError("dataset episodes must be non-negative")
+        if len(value) != len(set(value)):
+            raise ValueError("dataset episodes must be unique")
+        return value
+
     @model_validator(mode="after")
     def policy_specific_fields(self) -> LeRobotTrainingConfig:
         groot_values = (
@@ -194,6 +252,35 @@ class RemoteTrainingRequest(BaseModel):
         if len(set(normalized)) != len(normalized):
             raise ValueError("GPU identifiers must be unique")
         return normalized
+
+
+class DatasetEvalConfig(BaseModel):
+    """Offline loss evaluation of a LeRobot policy over selected dataset episodes."""
+
+    job_id: str | None = None
+    policy_ref: str | None = None
+    checkpoint: str = "latest"
+    dataset_repo_id: str | None = None
+    dataset_revision: str | None = None
+    dataset_episodes: list[int]
+    gpu: str = "0"
+    batch_size: int = Field(default=8, ge=1)
+    num_workers: int = Field(default=4, ge=0)
+    policy_use_bf16: bool = False
+
+    @model_validator(mode="after")
+    def validate_sources(self) -> DatasetEvalConfig:
+        if bool(self.job_id) == bool(self.policy_ref):
+            raise ValueError("provide exactly one of job_id or policy_ref")
+        if self.policy_ref and not self.dataset_repo_id:
+            raise ValueError("dataset_repo_id is required when policy_ref is provided")
+        if not self.dataset_episodes:
+            raise ValueError("dataset_episodes is required")
+        if any(episode < 0 for episode in self.dataset_episodes):
+            raise ValueError("dataset episodes must be non-negative")
+        if len(self.dataset_episodes) != len(set(self.dataset_episodes)):
+            raise ValueError("dataset episodes must be unique")
+        return self
 
 
 def build_lerobot_training_command(
@@ -264,14 +351,18 @@ def build_lerobot_training_command(
         command += ["--policy.path", config.policy_pretrained_path]
     else:
         command += ["--policy.type", config.policy_type]
-    if config.dataset_revision:
-        command += ["--dataset.revision", config.dataset_revision]
+    command += ["--dataset.revision", config.dataset_revision or "main"]
+    if config.dataset_episodes:
+        command += ["--dataset.episodes", json.dumps(config.dataset_episodes)]
     if config.seed is not None:
         command += ["--seed", str(config.seed)]
     if config.wandb_enable and config.wandb_project:
         command += ["--wandb.project", config.wandb_project]
     if config.dataset_image_transforms_enable:
         command += ["--dataset.image_transforms.enable", "true"]
+
+    if config.dataset_repo_id in _ALEX_TEST_OBS_NEW_REPOS:
+        command += _alex_test_obs_new_policy_overrides(config.policy_type)
 
     if config.policy_type == "groot":
         optional = {
@@ -287,13 +378,99 @@ def build_lerobot_training_command(
                 rendered = str(value).lower() if isinstance(value, bool) else str(value)
                 command += [flag, rendered]
         if config.policy_relative_exclude_joints is not None:
-            import json
-
             command += [
                 "--policy.relative_exclude_joints",
                 json.dumps(config.policy_relative_exclude_joints),
             ]
     return command
+
+
+def build_demo_annotation_env(config: DemoAnnotationConfig) -> dict[str, str]:
+    """Return environment overrides needed by Arena's mimic annotation path."""
+    env: dict[str, str] = {}
+    if config.wrist_stiffness is not None:
+        env["ALEX_TELEOP_WRIST_STIFFNESS"] = str(config.wrist_stiffness)
+    if config.wrist_damping is not None:
+        env["ALEX_TELEOP_WRIST_DAMPING"] = str(config.wrist_damping)
+    return env
+
+
+def build_demo_annotation_command(config: DemoAnnotationConfig) -> list[str]:
+    """Build the minimal command for Arena's annotate_demos.py workflow.
+
+    The heavy dependencies stay in IsaacLab-Arena/Isaac Sim. Alex Lab only owns
+    this launcher contract so teleop, training, annotation, and rollout can be
+    driven from one repo without copying Arena internals.
+    """
+    script = "isaaclab_arena/scripts/imitation_learning/annotate_demos.py"
+    command = [
+        config.python_executable,
+        script,
+        "--device",
+        config.device,
+        "--viz",
+        config.viz,
+    ]
+    if config.mimic:
+        command.append("--mimic")
+    command += [
+        "--input_file",
+        config.input_file,
+        "--output_file",
+        config.output_file,
+        config.environment,
+        "--embodiment",
+        config.embodiment,
+        "--usd",
+        config.usd,
+    ]
+    if config.lever_dr:
+        command.append("--lever_dr")
+    if config.lever_pose_dr_xy_jitter is not None:
+        command += ["--lever_pose_dr_xy_jitter", str(config.lever_pose_dr_xy_jitter)]
+    if config.lever_pose_dr_yaw_jitter_deg is not None:
+        command += ["--lever_pose_dr_yaw_jitter_deg", str(config.lever_pose_dr_yaw_jitter_deg)]
+    if config.success_angle_threshold is not None:
+        command += ["--success_angle_threshold", str(config.success_angle_threshold)]
+    if config.container_name:
+        docker_prefix = ["docker", "exec", "-w", config.arena_workdir]
+        for key, value in build_demo_annotation_env(config).items():
+            docker_prefix += ["-e", f"{key}={value}"]
+        command = [*docker_prefix, config.container_name, *command]
+    return command
+
+
+def _alex_test_obs_new_policy_overrides(policy_type: str) -> list[str]:
+    """Return LeRobot policy flags required by H2Ozone/test_obs_new.
+
+    The dataset has a 48-D robot state and a 46-D action. Several LeRobot 0.6
+    policies default to smaller max/action dimensions and otherwise reject the
+    dataset during config validation or first forward pass.
+    """
+    if policy_type in _MAX_DIM_POLICY_TYPES:
+        return [
+            "--policy.max_state_dim",
+            str(_ALEX_TEST_OBS_NEW_STATE_DIM),
+            "--policy.max_action_dim",
+            str(_ALEX_TEST_OBS_NEW_ACTION_DIM),
+        ]
+    if policy_type == "fastwam":
+        return [
+            "--policy.action_dim",
+            str(_ALEX_TEST_OBS_NEW_ACTION_DIM),
+            "--policy.proprio_dim",
+            str(_ALEX_TEST_OBS_NEW_STATE_DIM),
+        ]
+    if policy_type == "lingbot_va":
+        import json
+
+        return [
+            "--policy.action_dim",
+            str(_ALEX_TEST_OBS_NEW_ACTION_DIM),
+            "--policy.used_action_channel_ids",
+            json.dumps(list(range(_ALEX_TEST_OBS_NEW_ACTION_DIM))),
+        ]
+    return []
 
 
 class EvaluationConfig(BaseModel):
@@ -315,6 +492,188 @@ class EvaluationConfig(BaseModel):
     container_name: str = "isaaclab_arena-latest"
     container_workdir: str = "/workspaces/isaaclab_arena"
     python_executable: str = "/isaac-sim/python.sh"
+
+
+DEFAULT_ARENA_LEVER_USD = "isaaclab_arena/assets/lever_sim/LEVER_AGAIN.usd"
+_LEROBOT_REMOTE_POLICY = "isaaclab_arena.policy.lerobot_remote_policy.LeRobotRemotePolicy"
+
+
+class RolloutConfig(BaseModel):
+    """A policy deployment against Arena, Isaac Lab/Sim, or the physical Alex robot."""
+
+    target: Literal["sim", "arena", "robot"] = "arena"
+    inference_location: Literal["remote", "local"] = "remote"
+    job_id: str | None = None
+    policy_ref: str | None = None
+    checkpoint: str = "latest"
+    dataset_repo_id: str | None = None
+    gpu: str = "0"
+    task: str = ""
+    fps: int = Field(default=30, ge=1, le=240)
+    actions_per_chunk: int | None = Field(default=None, ge=1)
+
+    # Arena defaults match Captury/demo recording (alex_empty + LEVER_AGAIN).
+    # For target=sim, clients should set environment to an Isaac Lab task id.
+    environment: str = "alex_empty"
+    embodiment: str = "alex_v2_ability_hands"
+    usd: str = DEFAULT_ARENA_LEVER_USD
+    num_episodes: int = Field(default=20, ge=1)
+    headless: bool = True
+    enable_cameras: bool = True
+    video: bool = False
+    camera_video: bool = False
+    video_dir: str | None = None
+    isaaclab_root: str = str(DEFAULT_ISAACLAB_ROOT)
+    arena_root: str = str(DEFAULT_ARENA_ROOT)
+    container_name: str = "isaaclab_arena-latest"
+    container_workdir: str = "/workspaces/isaaclab_arena"
+    python_executable: str = "/isaac-sim/python.sh"
+
+    # Real Alex target. Motion remains capability-gated by the LeRobot adapter.
+    ikstreamer_host: str = "127.0.0.1"
+    ikstreamer_port: int = Field(default=2102, ge=1, le=65535)
+
+    @model_validator(mode="after")
+    def exactly_one_policy_source(self) -> RolloutConfig:
+        if bool(self.job_id) == bool(self.policy_ref):
+            raise ValueError("provide exactly one of job_id or policy_ref")
+        if (
+            self.policy_ref
+            and "@" not in self.policy_ref
+            and not Path(self.policy_ref).expanduser().exists()
+            and not _HUB_REPO.fullmatch(self.policy_ref)
+        ):
+            # A plain owner/name Hub reference is valid. Other non-existent bare
+            # paths are rejected early instead of failing in a remote container.
+            raise ValueError("policy_ref must be a local path or Hub owner/name reference")
+        return self
+
+
+def build_isaaclab_rollout_command(
+    config: RolloutConfig,
+    inference_url: str,
+    manifest: dict[str, Any],
+    metrics_output: str | None = None,
+) -> list[str]:
+    """Build the direct Isaac Lab rollout command for the remote LeRobot adapter."""
+    import json
+
+    runner = str(Path(__file__).with_name("isaaclab_rollout_runner.py"))
+    isaaclab_root = Path(config.isaaclab_root).expanduser()
+    command = [
+        str(isaaclab_root / "isaaclab.sh"),
+        "-p",
+        runner,
+    ]
+    if config.headless:
+        command.append("--headless")
+    if config.enable_cameras:
+        command.append("--enable_cameras")
+    command += [
+        "--environment",
+        config.environment,
+        "--num_episodes",
+        str(config.num_episodes),
+        "--remote_url",
+        inference_url,
+        "--rollout_manifest",
+        json.dumps(manifest, separators=(",", ":")),
+        "--fps",
+        str(config.fps),
+    ]
+    if config.task:
+        command += ["--language_instruction", config.task]
+    if config.video:
+        command.append("--video")
+    if config.camera_video:
+        command.append("--camera_video")
+    if config.video_dir:
+        command += ["--video_dir", config.video_dir]
+    if metrics_output:
+        command += ["--metrics_output", metrics_output]
+    command += ["--embodiment", config.embodiment]
+    return command
+
+
+class TeleopConfig(BaseModel):
+    """A local Isaac Lab teleoperation session driving Alex directly."""
+
+    environment: str = "Isaac-Alex-Lever-Play-v0"
+    teleop_device: Literal["keyboard", "spacemouse", "gamepad", "handtracking"] = "keyboard"
+    num_envs: int = Field(default=1, ge=1)
+    sensitivity: float = Field(default=1.0, gt=0)
+    isaaclab_root: str = str(DEFAULT_ISAACLAB_ROOT)
+
+
+def build_isaaclab_teleop_command(config: TeleopConfig) -> list[str]:
+    """Build the direct Isaac Lab teleoperation command for a local viewer session."""
+    isaaclab_root = Path(config.isaaclab_root).expanduser()
+    script = isaaclab_root / "scripts" / "environments" / "teleoperation" / "teleop_se3_agent.py"
+    return [
+        str(isaaclab_root / "isaaclab.sh"),
+        "-p",
+        str(script),
+        "--task",
+        config.environment,
+        "--teleop_device",
+        config.teleop_device,
+        "--num_envs",
+        str(config.num_envs),
+        "--sensitivity",
+        str(config.sensitivity),
+    ]
+
+
+def build_arena_rollout_command(
+    config: RolloutConfig,
+    inference_url: str,
+    manifest: dict[str, Any],
+    metrics_output: str | None = None,
+) -> list[str]:
+    """Build docker-exec Arena policy_runner command for a remote LeRobot policy."""
+    import json
+
+    del metrics_output  # Arena prints metrics; LeLab tracks exit code.
+    runner = str(Path(config.container_workdir) / "isaaclab_arena/evaluation/policy_runner.py")
+    command = [
+        "docker",
+        "exec",
+        config.container_name,
+        config.python_executable,
+        runner,
+        "--device",
+        "cuda",
+    ]
+    if config.headless:
+        command.append("--headless")
+    if config.enable_cameras:
+        command.append("--enable_cameras")
+    command += [
+        "--num_episodes",
+        str(config.num_episodes),
+        "--policy_type",
+        _LEROBOT_REMOTE_POLICY,
+        "--remote_url",
+        inference_url,
+        "--rollout_manifest",
+        json.dumps(manifest, separators=(",", ":")),
+    ]
+    # No --policy_device: LeRobotRemotePolicy.add_args_to_parser doesn't register it, so an
+    # unrecognized flag here shifts argparse's positional matching and "cuda" gets swallowed
+    # as the environment subparser choice, raising "invalid choice: 'cuda'".
+    if config.task:
+        command += ["--language_instruction", config.task]
+    if config.video:
+        command.append("--video")
+    if config.camera_video:
+        command.append("--camera_video")
+    if config.video_dir:
+        command += ["--video_dir", config.video_dir]
+    # Environment is an argparse subparser and must precede env-specific args.
+    command += [config.environment, "--embodiment", config.embodiment]
+    if config.usd:
+        command += ["--usd", config.usd]
+    return command
 
 
 def build_dataset_conversion_command(config: DatasetConversionConfig) -> list[str]:

@@ -60,6 +60,8 @@ export default function Training() {
   const [selected, setSelected] = useState<number[]>([]);
   const [name, setName] = useState("alex-policy");
   const [config, setConfig] = useState<LeRobotTrainingConfig>(initialConfig);
+  const [episodeSpec, setEpisodeSpec] = useState("");
+  const [episodeError, setEpisodeError] = useState<string | null>(null);
   const datasetRepoValid = /^[^\s/]+\/[^\s/]+$/.test(config.dataset_repo_id);
   const capabilities = useQuery({
     queryKey: ["training-capabilities", config.dataset_repo_id],
@@ -103,7 +105,19 @@ export default function Training() {
     });
   };
   const submit = () => {
-    const payload: TrainingRequest = { name, config, gpus: selected.map(String) };
+    let datasetEpisodes: number[] | undefined;
+    try {
+      datasetEpisodes = parseEpisodeSpec(episodeSpec);
+      setEpisodeError(null);
+    } catch (error) {
+      setEpisodeError(error instanceof Error ? error.message : "Invalid episode selection");
+      return;
+    }
+    const payloadConfig: LeRobotTrainingConfig = {
+      ...config,
+      dataset_episodes: datasetEpisodes,
+    };
+    const payload: TrainingRequest = { name, config: payloadConfig, gpus: selected.map(String) };
     launch.mutate(payload);
   };
   const policyBlocked = !selectedPolicy?.available || !selectedPolicy.compatible;
@@ -180,6 +194,17 @@ export default function Training() {
             <Field label="Run name"><input className={inputClass} value={name} onChange={(event) => setName(event.target.value)} /></Field>
             <Field label="Hugging Face model repo"><input required className={inputClass} placeholder="owner/alex-act" value={config.model_repo_id} onChange={(event) => update("model_repo_id", event.target.value)} /></Field>
             <Field label="Pretrained policy (optional)"><input className={inputClass} placeholder="owner/model or local image path" value={config.policy_pretrained_path || ""} onChange={(event) => update("policy_pretrained_path", event.target.value || undefined)} /></Field>
+            <Field label="Training episodes (optional)">
+              <input
+                className={inputClass}
+                placeholder="14:29,50:115"
+                value={episodeSpec}
+                onChange={(event) => {
+                  setEpisodeSpec(event.target.value);
+                  setEpisodeError(null);
+                }}
+              />
+            </Field>
             <NumberField label="Training steps" value={config.steps} min={1} onChange={(value) => update("steps", value)} />
             <NumberField label="Batch size per GPU" value={config.batch_size} min={1} onChange={(value) => update("batch_size", value)} />
             <NumberField label="Data-loader workers" value={config.num_workers} min={0} onChange={(value) => update("num_workers", value)} />
@@ -202,12 +227,44 @@ export default function Training() {
           </div>
           {config.wandb_enable && <div className="mt-4"><Field label="W&B project"><input className={inputClass} value={config.wandb_project || ""} onChange={(event) => update("wandb_project", event.target.value || undefined)} /></Field></div>}
           {selected.some((index) => gpus[index]?.occupied) && <div className="mt-4 flex gap-2 rounded-xl border border-amber-400/20 bg-amber-400/10 p-3 text-sm text-amber-200"><AlertTriangle className="h-4 w-4 shrink-0" /> Selected GPUs have active processes. Launching may cause contention.</div>}
+          {episodeError && <div className="mt-4 rounded-xl border border-rose-400/20 bg-rose-400/10 p-3 text-sm text-rose-200">{episodeError}</div>}
           <div className="mt-5"><ErrorNote error={launch.error} /></div>
           <button className={`${buttonClass} mt-5 w-full`} disabled={!canLaunch || launch.isPending} onClick={submit}>{launch.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4 fill-current" />} Launch on {selected.length} GPU{selected.length === 1 ? "" : "s"}</button>
         </Panel>
       </div>
     </>
   );
+}
+
+function parseEpisodeSpec(value: string): number[] | undefined {
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+
+  const episodes: number[] = [];
+  for (const rawPart of trimmed.split(",")) {
+    const part = rawPart.trim();
+    if (!part) continue;
+    const range = part.match(/^(\d+)\s*:\s*(\d+)$/);
+    if (range) {
+      const start = Number(range[1]);
+      const end = Number(range[2]);
+      if (end <= start) throw new Error(`Episode range ${part} must end after it starts.`);
+      for (let episode = start; episode < end; episode += 1) episodes.push(episode);
+      continue;
+    }
+    if (!/^\d+$/.test(part)) {
+      throw new Error("Use episode numbers or half-open ranges like 14:29,50:115.");
+    }
+    episodes.push(Number(part));
+  }
+
+  if (episodes.length === 0) return undefined;
+  const seen = new Set<number>();
+  for (const episode of episodes) {
+    if (seen.has(episode)) throw new Error(`Episode ${episode} is listed more than once.`);
+    seen.add(episode);
+  }
+  return episodes;
 }
 
 function applyPolicyDefaults(config: LeRobotTrainingConfig, policy: PolicyCapability): LeRobotTrainingConfig {

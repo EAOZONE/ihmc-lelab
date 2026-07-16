@@ -1,6 +1,31 @@
 from unittest.mock import MagicMock
 
 
+def test_every_alex_policy_has_test_obs_new_compatibility_bucket() -> None:
+    from lelab import policies
+    from lelab.alex_models import _MAX_DIM_POLICY_TYPES
+
+    builtin_compatible = {
+        "act",
+        "diffusion",
+        "gaussian_actor",
+        "groot",
+        "multi_task_dit",
+        "vla_jepa",
+    }
+    fixed_action_dim = {"fastwam", "lingbot_va"}
+    feature_filtered = {"tdmpc", "vqbet"}
+
+    accounted = (
+        builtin_compatible
+        | set(_MAX_DIM_POLICY_TYPES)
+        | fixed_action_dim
+        | feature_filtered
+    )
+
+    assert set(policies._LABELS) == accounted
+
+
 def test_capabilities_mark_dataset_incompatibility(monkeypatch) -> None:
     from lelab import policies
 
@@ -54,6 +79,138 @@ def test_capabilities_preserve_missing_extra_reason(monkeypatch) -> None:
     result = policies.get_training_capabilities(cluster=cluster)
     assert result["policies"][0]["available"] is False
     assert result["policies"][0]["unavailable_reason"] == "missing transformers"
+
+
+def test_capabilities_filter_removed_policy_types(monkeypatch) -> None:
+    from lelab import policies
+
+    policies._cache.clear()
+    monkeypatch.setattr(
+        policies,
+        "_remote_probe",
+        lambda cluster, image: {
+            "lerobot_version": "0.6.0",
+            "policies": [
+                {"type": "molmoact2", "available": True, "unavailable_reason": None},
+                {"type": "fastwam", "available": True, "unavailable_reason": None},
+            ],
+        },
+    )
+    cluster = MagicMock()
+    cluster.status.return_value = {"connected": True}
+    result = policies.get_training_capabilities(
+        dataset={
+            "repo_id": "H2Ozone/test_obs_new",
+            "valid": True,
+            "features": ["observation.state", "action", "observation.images.left"],
+            "state_dim": 48,
+            "action_dim": 46,
+            "cameras": ["observation.images.left"],
+            "has_tasks": True,
+        },
+        cluster=cluster,
+    )
+    assert [item["type"] for item in result["policies"]] == ["fastwam"]
+    assert result["policies"][0]["compatible"] is True
+
+
+def test_capabilities_require_feature_filter_for_tdmpc_and_vqbet(monkeypatch) -> None:
+    from lelab import policies
+
+    policies._cache.clear()
+    monkeypatch.setattr(
+        policies,
+        "_remote_probe",
+        lambda cluster, image: {
+            "lerobot_version": "0.6.0",
+            "policy_feature_filter": False,
+            "policies": [
+                {"type": "tdmpc", "available": True, "unavailable_reason": None},
+                {"type": "vqbet", "available": True, "unavailable_reason": None},
+            ],
+        },
+    )
+    cluster = MagicMock()
+    cluster.status.return_value = {"connected": True}
+    result = policies.get_training_capabilities(
+        dataset={
+            "repo_id": "H2Ozone/test_obs_new",
+            "valid": True,
+            "features": ["observation.state", "action", "observation.images.left", "observation.images.right"],
+            "state_dim": 48,
+            "action_dim": 46,
+            "cameras": ["observation.images.left", "observation.images.right"],
+            "has_tasks": True,
+        },
+        cluster=cluster,
+    )
+    for policy in result["policies"]:
+        assert policy["compatible"] is False
+        assert "feature-filter" in policy["compatibility_reason"]
+
+
+def test_capabilities_allow_tdmpc_and_vqbet_with_feature_filter(monkeypatch) -> None:
+    from lelab import policies
+
+    policies._cache.clear()
+    monkeypatch.setattr(
+        policies,
+        "_remote_probe",
+        lambda cluster, image: {
+            "lerobot_version": "0.6.0",
+            "policy_feature_filter": True,
+            "policies": [
+                {"type": "tdmpc", "available": True, "unavailable_reason": None},
+                {"type": "vqbet", "available": True, "unavailable_reason": None},
+            ],
+        },
+    )
+    cluster = MagicMock()
+    cluster.status.return_value = {"connected": True}
+    result = policies.get_training_capabilities(
+        dataset={
+            "repo_id": "H2Ozone/test_obs_new",
+            "valid": True,
+            "features": ["observation.state", "action", "observation.images.left", "observation.images.right"],
+            "state_dim": 48,
+            "action_dim": 46,
+            "cameras": ["observation.images.left", "observation.images.right"],
+            "has_tasks": True,
+        },
+        cluster=cluster,
+    )
+    assert all(policy["compatible"] for policy in result["policies"])
+
+
+def test_capabilities_mark_vqbet_without_camera_incompatible(monkeypatch) -> None:
+    from lelab import policies
+
+    policies._cache.clear()
+    monkeypatch.setattr(
+        policies,
+        "_remote_probe",
+        lambda cluster, image: {
+            "lerobot_version": "0.6.0",
+            "policy_feature_filter": True,
+            "policies": [{"type": "vqbet", "available": True, "unavailable_reason": None}],
+        },
+    )
+    cluster = MagicMock()
+    cluster.status.return_value = {"connected": True}
+    result = policies.get_training_capabilities(
+        dataset={
+            "repo_id": "user/state-only",
+            "valid": True,
+            "features": ["observation.state", "action"],
+            "state_dim": 48,
+            "action_dim": 46,
+            "cameras": [],
+            "has_tasks": True,
+        },
+        cluster=cluster,
+    )
+    assert result["policies"][0]["compatible"] is False
+    assert "camera" in result["policies"][0]["compatibility_reason"]
 
 
 def test_capabilities_report_non_finite_stats_repair(monkeypatch) -> None:
