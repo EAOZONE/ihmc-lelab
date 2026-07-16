@@ -18,13 +18,15 @@ RUN python3 -m pip install --break-system-packages --no-cache-dir \
 # Keep this pin aligned with the Alex Lab runtime. The explicit extras are the
 # policy families supported by LeRobot's standard offline training pipeline.
 RUN python3 -m pip install --break-system-packages --no-cache-dir \
-    "lerobot[training,diffusion,pi,smolvla,groot,eo1,evo1,fastwam,lingbot-va,molmoact2,multi-task-dit,vla-jepa,wallx,xvla]==0.6.0"
+    "lerobot[training,diffusion,pi,smolvla,groot,eo1,evo1,fastwam,lingbot-va,multi-task-dit,vla-jepa,wallx,xvla]==0.6.0"
 
 # LeRobot serializes non-finite JSON stats as strings. Load those values as
 # numeric arrays and derive unusable std entries from the finite min/max range.
 # The Hub dataset is never modified; this is an in-memory compatibility layer.
 COPY docker/alex_lerobot_compat.py /usr/local/lib/python3.12/dist-packages/alex_lerobot_compat.py
 COPY docker/alex_lerobot_compat.pth /usr/local/lib/python3.12/dist-packages/alex_lerobot_compat.pth
+COPY docker/alex_policy_server.py /opt/alex/alex_policy_server.py
+COPY docker/alex_train_with_manifest.py /opt/alex/alex_train_with_manifest.py
 
 RUN python3 -c "import alex_lerobot_compat, torch; assert torch.version.cuda == '12.8', (torch.__version__, torch.version.cuda); assert alex_lerobot_compat.ALEX_STATS_SANITIZER"
 

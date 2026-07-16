@@ -5,14 +5,29 @@ from __future__ import annotations
 import re
 import shlex
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 DEFAULT_ARENA_ROOT = Path("/home/bpratt/IsaacLab-Arena")
+DEFAULT_ISAACLAB_ROOT = Path("/home/bpratt/IsaacLab")
 _SAFE_IMAGE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:@-]*$")
 _SAFE_POLICY = re.compile(r"^[a-z][a-z0-9_]*$")
 _HUB_REPO = re.compile(r"^[^\s/]+/[^\s/]+$")
+
+_ALEX_TEST_OBS_NEW_STATE_DIM = 48
+_ALEX_TEST_OBS_NEW_ACTION_DIM = 46
+_ALEX_TEST_OBS_NEW_REPOS = {"H2Ozone/test_obs_new"}
+_MAX_DIM_POLICY_TYPES = {
+    "eo1",
+    "evo1",
+    "pi0",
+    "pi05",
+    "pi0_fast",
+    "smolvla",
+    "wall_x",
+    "xvla",
+}
 
 
 class DatasetInspectRequest(BaseModel):
@@ -273,6 +288,9 @@ def build_lerobot_training_command(
     if config.dataset_image_transforms_enable:
         command += ["--dataset.image_transforms.enable", "true"]
 
+    if config.dataset_repo_id in _ALEX_TEST_OBS_NEW_REPOS:
+        command += _alex_test_obs_new_policy_overrides(config.policy_type)
+
     if config.policy_type == "groot":
         optional = {
             "--policy.base_model_path": config.policy_base_model_path,
@@ -296,6 +314,39 @@ def build_lerobot_training_command(
     return command
 
 
+def _alex_test_obs_new_policy_overrides(policy_type: str) -> list[str]:
+    """Return LeRobot policy flags required by H2Ozone/test_obs_new.
+
+    The dataset has a 48-D robot state and a 46-D action. Several LeRobot 0.6
+    policies default to smaller max/action dimensions and otherwise reject the
+    dataset during config validation or first forward pass.
+    """
+    if policy_type in _MAX_DIM_POLICY_TYPES:
+        return [
+            "--policy.max_state_dim",
+            str(_ALEX_TEST_OBS_NEW_STATE_DIM),
+            "--policy.max_action_dim",
+            str(_ALEX_TEST_OBS_NEW_ACTION_DIM),
+        ]
+    if policy_type == "fastwam":
+        return [
+            "--policy.action_dim",
+            str(_ALEX_TEST_OBS_NEW_ACTION_DIM),
+            "--policy.proprio_dim",
+            str(_ALEX_TEST_OBS_NEW_STATE_DIM),
+        ]
+    if policy_type == "lingbot_va":
+        import json
+
+        return [
+            "--policy.action_dim",
+            str(_ALEX_TEST_OBS_NEW_ACTION_DIM),
+            "--policy.used_action_channel_ids",
+            json.dumps(list(range(_ALEX_TEST_OBS_NEW_ACTION_DIM))),
+        ]
+    return []
+
+
 class EvaluationConfig(BaseModel):
     policy_type: str
     model_path: str
@@ -315,6 +366,188 @@ class EvaluationConfig(BaseModel):
     container_name: str = "isaaclab_arena-latest"
     container_workdir: str = "/workspaces/isaaclab_arena"
     python_executable: str = "/isaac-sim/python.sh"
+
+
+DEFAULT_ARENA_LEVER_USD = "isaaclab_arena/assets/lever_sim/LEVER_AGAIN.usd"
+_LEROBOT_REMOTE_POLICY = "isaaclab_arena.policy.lerobot_remote_policy.LeRobotRemotePolicy"
+
+
+class RolloutConfig(BaseModel):
+    """A policy deployment against Arena, Isaac Lab/Sim, or the physical Alex robot."""
+
+    target: Literal["sim", "arena", "robot"] = "arena"
+    inference_location: Literal["remote", "local"] = "remote"
+    job_id: str | None = None
+    policy_ref: str | None = None
+    checkpoint: str = "latest"
+    dataset_repo_id: str | None = None
+    gpu: str = "0"
+    task: str = ""
+    fps: int = Field(default=30, ge=1, le=240)
+    actions_per_chunk: int | None = Field(default=None, ge=1)
+
+    # Arena defaults match Captury/demo recording (alex_empty + LEVER_AGAIN).
+    # For target=sim, clients should set environment to an Isaac Lab task id.
+    environment: str = "alex_empty"
+    embodiment: str = "alex_v2_ability_hands"
+    usd: str = DEFAULT_ARENA_LEVER_USD
+    num_episodes: int = Field(default=20, ge=1)
+    headless: bool = True
+    enable_cameras: bool = True
+    video: bool = False
+    camera_video: bool = False
+    video_dir: str | None = None
+    isaaclab_root: str = str(DEFAULT_ISAACLAB_ROOT)
+    arena_root: str = str(DEFAULT_ARENA_ROOT)
+    container_name: str = "isaaclab_arena-latest"
+    container_workdir: str = "/workspaces/isaaclab_arena"
+    python_executable: str = "/isaac-sim/python.sh"
+
+    # Real Alex target. Motion remains capability-gated by the LeRobot adapter.
+    ikstreamer_host: str = "127.0.0.1"
+    ikstreamer_port: int = Field(default=2102, ge=1, le=65535)
+
+    @model_validator(mode="after")
+    def exactly_one_policy_source(self) -> RolloutConfig:
+        if bool(self.job_id) == bool(self.policy_ref):
+            raise ValueError("provide exactly one of job_id or policy_ref")
+        if (
+            self.policy_ref
+            and "@" not in self.policy_ref
+            and not Path(self.policy_ref).expanduser().exists()
+            and not _HUB_REPO.fullmatch(self.policy_ref)
+        ):
+            # A plain owner/name Hub reference is valid. Other non-existent bare
+            # paths are rejected early instead of failing in a remote container.
+            raise ValueError("policy_ref must be a local path or Hub owner/name reference")
+        return self
+
+
+def build_isaaclab_rollout_command(
+    config: RolloutConfig,
+    inference_url: str,
+    manifest: dict[str, Any],
+    metrics_output: str | None = None,
+) -> list[str]:
+    """Build the direct Isaac Lab rollout command for the remote LeRobot adapter."""
+    import json
+
+    runner = str(Path(__file__).with_name("isaaclab_rollout_runner.py"))
+    isaaclab_root = Path(config.isaaclab_root).expanduser()
+    command = [
+        str(isaaclab_root / "isaaclab.sh"),
+        "-p",
+        runner,
+    ]
+    if config.headless:
+        command.append("--headless")
+    if config.enable_cameras:
+        command.append("--enable_cameras")
+    command += [
+        "--environment",
+        config.environment,
+        "--num_episodes",
+        str(config.num_episodes),
+        "--remote_url",
+        inference_url,
+        "--rollout_manifest",
+        json.dumps(manifest, separators=(",", ":")),
+        "--fps",
+        str(config.fps),
+    ]
+    if config.task:
+        command += ["--language_instruction", config.task]
+    if config.video:
+        command.append("--video")
+    if config.camera_video:
+        command.append("--camera_video")
+    if config.video_dir:
+        command += ["--video_dir", config.video_dir]
+    if metrics_output:
+        command += ["--metrics_output", metrics_output]
+    command += ["--embodiment", config.embodiment]
+    return command
+
+
+class TeleopConfig(BaseModel):
+    """A local Isaac Lab teleoperation session driving Alex directly."""
+
+    environment: str = "Isaac-Alex-Lever-Play-v0"
+    teleop_device: Literal["keyboard", "spacemouse", "gamepad", "handtracking"] = "keyboard"
+    num_envs: int = Field(default=1, ge=1)
+    sensitivity: float = Field(default=1.0, gt=0)
+    isaaclab_root: str = str(DEFAULT_ISAACLAB_ROOT)
+
+
+def build_isaaclab_teleop_command(config: TeleopConfig) -> list[str]:
+    """Build the direct Isaac Lab teleoperation command for a local viewer session."""
+    isaaclab_root = Path(config.isaaclab_root).expanduser()
+    script = isaaclab_root / "scripts" / "environments" / "teleoperation" / "teleop_se3_agent.py"
+    return [
+        str(isaaclab_root / "isaaclab.sh"),
+        "-p",
+        str(script),
+        "--task",
+        config.environment,
+        "--teleop_device",
+        config.teleop_device,
+        "--num_envs",
+        str(config.num_envs),
+        "--sensitivity",
+        str(config.sensitivity),
+    ]
+
+
+def build_arena_rollout_command(
+    config: RolloutConfig,
+    inference_url: str,
+    manifest: dict[str, Any],
+    metrics_output: str | None = None,
+) -> list[str]:
+    """Build docker-exec Arena policy_runner command for a remote LeRobot policy."""
+    import json
+
+    del metrics_output  # Arena prints metrics; LeLab tracks exit code.
+    runner = str(Path(config.container_workdir) / "isaaclab_arena/evaluation/policy_runner.py")
+    command = [
+        "docker",
+        "exec",
+        config.container_name,
+        config.python_executable,
+        runner,
+        "--device",
+        "cuda",
+    ]
+    if config.headless:
+        command.append("--headless")
+    if config.enable_cameras:
+        command.append("--enable_cameras")
+    command += [
+        "--num_episodes",
+        str(config.num_episodes),
+        "--policy_type",
+        _LEROBOT_REMOTE_POLICY,
+        "--remote_url",
+        inference_url,
+        "--rollout_manifest",
+        json.dumps(manifest, separators=(",", ":")),
+    ]
+    # No --policy_device: LeRobotRemotePolicy.add_args_to_parser doesn't register it, so an
+    # unrecognized flag here shifts argparse's positional matching and "cuda" gets swallowed
+    # as the environment subparser choice, raising "invalid choice: 'cuda'".
+    if config.task:
+        command += ["--language_instruction", config.task]
+    if config.video:
+        command.append("--video")
+    if config.camera_video:
+        command.append("--camera_video")
+    if config.video_dir:
+        command += ["--video_dir", config.video_dir]
+    # Environment is an argparse subparser and must precede env-specific args.
+    command += [config.environment, "--embodiment", config.embodiment]
+    if config.usd:
+        command += ["--usd", config.usd]
+    return command
 
 
 def build_dataset_conversion_command(config: DatasetConversionConfig) -> list[str]:

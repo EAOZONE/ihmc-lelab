@@ -280,6 +280,7 @@ def test_dev_launcher_builds_expected_subprocess_commands(
     monkeypatch.setattr(launcher, "_start_process", fake_start_process)
     monkeypatch.setattr(launcher, "_install_signal_handlers", lambda: None)
     monkeypatch.setattr(launcher, "_monitor_processes", stop_after_start)
+    monkeypatch.setattr(launcher, "_shutdown_processes", lambda _processes: None)
     monkeypatch.setattr(launcher.webbrowser, "open", browser_open)
 
     with pytest.raises(SystemExit) as exc:
@@ -292,7 +293,7 @@ def test_dev_launcher_builds_expected_subprocess_commands(
         frontend,
     )
     assert started[1][0] == "backend"
-    assert started[1][1][:4] == [launcher.sys.executable, "-m", "uvicorn", "lelab.server:app"]
+    assert started[1][1][:4] == [launcher.sys.executable, "-m", "uvicorn", "lelab.alex_server:app"]
     assert "--reload" in started[1][1]
     assert started[1][2] == tmp_path
     browser_open.assert_not_called()
@@ -436,3 +437,23 @@ def test_dev_launcher_reports_frontend_exit_before_ready(
 
     assert "Frontend exited early with code 7" in caplog.text
     assert "Check the Vite output above" in caplog.text
+
+
+def test_rollout_cli_parser_supports_job_and_direct_policy_sources() -> None:
+    from lelab.scripts.lelab import _build_parser
+
+    job = _build_parser().parse_args(["rollout", "--job", "job-1", "--checkpoint", "latest"])
+    assert job.command == "rollout"
+    assert job.job_id == "job-1"
+    assert job.target == "arena"
+    assert job.environment == "alex_empty"
+    assert job.usd.endswith("LEVER_AGAIN.usd")
+    sim = _build_parser().parse_args(["rollout", "--job", "job-1", "--target", "sim"])
+    assert sim.target == "sim"
+    legacy = _build_parser().parse_args(["rollout", "--job", "job-1", "--target", "arena"])
+    assert legacy.target == "arena"
+    direct = _build_parser().parse_args(
+        ["rollout", "--policy", "owner/model", "--dataset-repo", "owner/data", "--target", "robot"]
+    )
+    assert direct.policy_ref == "owner/model"
+    assert direct.target == "robot"

@@ -22,7 +22,6 @@ _LABELS = {
     "gaussian_actor": "Gaussian Actor",
     "groot": "GR00T N1.7",
     "lingbot_va": "LingBot-VA",
-    "molmoact2": "MolmoAct2",
     "multi_task_dit": "Multi-task DiT",
     "pi0": "π₀",
     "pi0_fast": "π₀-FAST",
@@ -44,22 +43,25 @@ _VISUAL_POLICIES = {
     "fastwam",
     "groot",
     "lingbot_va",
-    "molmoact2",
     "multi_task_dit",
     "pi0",
     "pi0_fast",
     "pi05",
     "smolvla",
+    "vqbet",
     "vla_jepa",
     "wall_x",
     "xvla",
+}
+_STATE_POLICIES = {
+    "tdmpc",
+    "vqbet",
 }
 _LANGUAGE_POLICIES = {
     "eo1",
     "evo1",
     "groot",
     "lingbot_va",
-    "molmoact2",
     "multi_task_dit",
     "pi0",
     "pi0_fast",
@@ -69,6 +71,7 @@ _LANGUAGE_POLICIES = {
     "wall_x",
     "xvla",
 }
+_POLICY_FEATURE_FILTER_POLICIES = {"tdmpc", "vqbet"}
 
 _PROBE_SCRIPT = r'''
 import importlib.metadata
@@ -107,6 +110,7 @@ print("ALEX_CAPABILITIES=" + json.dumps({
     "cuda_available": torch.cuda.is_available(),
     "cuda_device_count": torch.cuda.device_count(),
     "stats_sanitizer": bool(getattr(sys.modules.get("alex_lerobot_compat"), "ALEX_STATS_SANITIZER", False)),
+    "policy_feature_filter": bool(getattr(sys.modules.get("alex_lerobot_compat"), "ALEX_POLICY_FEATURE_FILTER", False)),
     "policies": rows,
 }, separators=(",", ":")))
 '''
@@ -128,6 +132,9 @@ action_feature = features.get("action") if isinstance(features, dict) else None
 action_names = action_feature.get("names") if isinstance(action_feature, dict) else None
 action_shape = action_feature.get("shape") if isinstance(action_feature, dict) else None
 action_dim = action_shape[0] if isinstance(action_shape, list) and action_shape else None
+state_feature = features.get("observation.state") if isinstance(features, dict) else None
+state_shape = state_feature.get("shape") if isinstance(state_feature, dict) else None
+state_dim = state_shape[0] if isinstance(state_shape, list) and state_shape else None
 groot_relative_actions_ready = (
     isinstance(action_names, list)
     and isinstance(action_dim, int)
@@ -177,6 +184,8 @@ print("ALEX_DATASET=" + json.dumps({
     "revision": getattr(dataset_info, "sha", None),
     "valid": bool(features) and layout != "unknown",
     "features": list(features),
+    "state_dim": state_dim,
+    "action_dim": action_dim,
     "cameras": cameras,
     "has_tasks": has_tasks_parquet or "meta/tasks.jsonl" in siblings,
     "non_finite_stats": non_finite_stats,
@@ -241,12 +250,24 @@ def _compatibility(policy_type: str, dataset: dict[str, Any] | None) -> tuple[bo
     features = set(dataset.get("features") or [])
     if "action" not in features:
         return False, "Dataset is missing the action feature."
+    if policy_type in _STATE_POLICIES and "observation.state" not in features:
+        return False, "This policy requires the observation.state feature."
     cameras = dataset.get("cameras") or []
     if policy_type in _VISUAL_POLICIES and not cameras:
         return False, "This policy requires at least one image or video camera feature."
     if policy_type in _LANGUAGE_POLICIES and not dataset.get("has_tasks"):
         return False, "This language-conditioned policy requires dataset task metadata."
     return True, None
+
+
+def _needs_alex_policy_feature_filter(policy_type: str, dataset: dict[str, Any] | None) -> bool:
+    if policy_type not in _POLICY_FEATURE_FILTER_POLICIES or dataset is None:
+        return False
+    return (
+        dataset.get("state_dim") == 48
+        and dataset.get("action_dim") == 46
+        and len(dataset.get("cameras") or []) >= 2
+    )
 
 
 def get_training_capabilities(
@@ -296,7 +317,19 @@ def get_training_capabilities(
     policies = []
     for item in probe.get("policies", []):
         policy_type = str(item.get("type") or "")
+        if policy_type not in _LABELS:
+            continue
         compatible, reason = _compatibility(policy_type, dataset)
+        if (
+            compatible
+            and _needs_alex_policy_feature_filter(policy_type, dataset)
+            and not probe.get("policy_feature_filter")
+        ):
+            compatible = False
+            reason = (
+                "This policy needs the Alex LeRobot feature-filter compatibility shim for "
+                "H2Ozone/test_obs_new. Rebuild the Alex training image."
+            )
         fields: list[dict[str, Any]] = [
             {
                 "name": "policy_pretrained_path",
@@ -307,11 +340,21 @@ def get_training_capabilities(
         ]
         if policy_type == "groot":
             fields += [
-                {"name": "policy_base_model_path", "label": "Base model", "type": "string", "default": "nvidia/GR00T-N1.7-3B"},
+                {
+                    "name": "policy_base_model_path",
+                    "label": "Base model",
+                    "type": "string",
+                    "default": "nvidia/GR00T-N1.7-3B",
+                },
                 {"name": "policy_embodiment_tag", "label": "Embodiment", "type": "string", "default": "new_embodiment"},
                 {"name": "policy_chunk_size", "label": "Chunk size", "type": "integer", "default": 16},
                 {"name": "policy_n_action_steps", "label": "Action steps", "type": "integer", "default": 16},
-                {"name": "policy_use_relative_actions", "label": "Relative actions", "type": "boolean", "default": False},
+                {
+                    "name": "policy_use_relative_actions",
+                    "label": "Relative actions",
+                    "type": "boolean",
+                    "default": False,
+                },
                 {"name": "policy_use_bf16", "label": "Use bfloat16", "type": "boolean", "default": True},
             ]
         policies.append(

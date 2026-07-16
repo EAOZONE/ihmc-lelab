@@ -39,3 +39,19 @@ def test_fingerprint_policy_accepts_only_exact_sha256() -> None:
     other = paramiko.RSAKey.generate(1024)
     with pytest.raises(HostKeyVerificationError, match="host key mismatch"):
         policy.missing_host_key(MagicMock(), "gpu2", other)
+
+
+def test_ssh_tunnel_bridge_suppresses_remote_connect_refused(monkeypatch) -> None:
+    from lelab.cluster import SshTunnel
+
+    tunnel = object.__new__(SshTunnel)
+    tunnel._remote = ("127.0.0.1", 24000)
+    tunnel._stop = MagicMock()
+    tunnel._stop.is_set.return_value = False
+    tunnel._transport = MagicMock()
+    tunnel._transport.open_channel.side_effect = paramiko.ChannelException(2, "Connect failed")
+    client = MagicMock()
+
+    tunnel._bridge(client, ("127.0.0.1", 12345))
+
+    client.close.assert_called_once()

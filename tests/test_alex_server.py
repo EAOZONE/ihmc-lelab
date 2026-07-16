@@ -154,3 +154,75 @@ def test_training_rejects_unsupported_groot_relative_actions(monkeypatch) -> Non
     )
     assert response.status_code == 409
     assert "Disable 'Use relative actions'" in response.json()["detail"]
+
+
+def test_teleop_start_returns_running_session(monkeypatch) -> None:
+    from lelab import alex_server
+    from lelab.alex_teleop import TeleopRecord
+
+    record = TeleopRecord(
+        id="teleop-1",
+        state="running",
+        config={"environment": "Isaac-Alex-Lever-Play-v0"},
+        started_at=0.0,
+        pid=123,
+        log_path="/tmp/teleop-1.log",
+    )
+    monkeypatch.setattr(alex_server.teleop_manager, "start", MagicMock(return_value=record))
+    response = client.post("/alex/teleop", json={})
+    assert response.status_code == 201
+    body = response.json()
+    assert body["id"] == "teleop-1"
+    assert body["status"] == "running"
+    assert body["pid"] == 123
+
+
+def test_teleop_start_missing_launcher_returns_400(monkeypatch) -> None:
+    from lelab import alex_server
+
+    monkeypatch.setattr(
+        alex_server.teleop_manager,
+        "start",
+        MagicMock(side_effect=FileNotFoundError("Isaac Lab launcher not found: /missing/isaaclab.sh")),
+    )
+    response = client.post("/alex/teleop", json={})
+    assert response.status_code == 400
+
+
+def test_teleop_session_not_found_returns_404(monkeypatch) -> None:
+    from lelab import alex_server
+
+    monkeypatch.setattr(alex_server.teleop_manager, "get", MagicMock(side_effect=KeyError("teleop-x")))
+    assert client.get("/alex/teleop/teleop-x").status_code == 404
+    monkeypatch.setattr(alex_server.teleop_manager, "logs", MagicMock(side_effect=KeyError("teleop-x")))
+    assert client.get("/alex/teleop/teleop-x/logs").status_code == 404
+    monkeypatch.setattr(alex_server.teleop_manager, "stop", MagicMock(side_effect=KeyError("teleop-x")))
+    assert client.post("/alex/teleop/teleop-x/stop").status_code == 404
+
+
+def test_teleop_stop_not_running_returns_409(monkeypatch) -> None:
+    from lelab import alex_server
+
+    monkeypatch.setattr(
+        alex_server.teleop_manager,
+        "stop",
+        MagicMock(side_effect=RuntimeError("teleop session is not running")),
+    )
+    response = client.post("/alex/teleop/teleop-1/stop")
+    assert response.status_code == 409
+
+
+def test_training_metrics_history_route(monkeypatch) -> None:
+    from lelab import alex_server
+    from lelab.jobs import MetricsHistoryPoint
+
+    monkeypatch.setattr(
+        alex_server.remote_job_manager,
+        "metrics_history",
+        MagicMock(return_value=[MetricsHistoryPoint(step=100, loss=0.42, lr=1e-4, grad_norm=1.5)]),
+    )
+
+    response = client.get("/alex/jobs/job-1/metrics-history")
+
+    assert response.status_code == 200
+    assert response.json()["points"] == [{"step": 100, "loss": 0.42, "lr": 1e-4, "grad_norm": 1.5}]

@@ -463,12 +463,89 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Stop a running LeLab (free ports 8000/8080) and exit.",
     )
+    commands = parser.add_subparsers(dest="command")
+    rollout = commands.add_parser("rollout", help="Run a trained policy in Arena, Isaac Lab/Sim, or against Alex.")
+    rollout.add_argument("--target", choices=("sim", "arena", "robot"), default="arena")
+    rollout.add_argument(
+        "--local-inference",
+        action="store_true",
+        help="Run the LeRobot policy server in a local Docker container instead of on the SSH training host.",
+    )
+    source = rollout.add_mutually_exclusive_group(required=True)
+    source.add_argument("--job", dest="job_id")
+    source.add_argument("--policy", dest="policy_ref")
+    rollout.add_argument("--checkpoint", default="latest")
+    rollout.add_argument("--dataset-repo")
+    rollout.add_argument("--gpu", default="0")
+    rollout.add_argument("--task", default="")
+    rollout.add_argument("--fps", type=int, default=30)
+    rollout.add_argument("--environment", default="alex_empty")
+    rollout.add_argument("--usd", default="isaaclab_arena/assets/lever_sim/LEVER_AGAIN.usd")
+    rollout.add_argument("--embodiment", default="alex_v2_ability_hands")
+    rollout.add_argument("--episodes", type=int, default=20)
+    rollout.add_argument("--show", action="store_true", help="Open the Isaac Sim viewer.")
+    rollout.add_argument("--video", action="store_true")
+    rollout.add_argument("--camera-video", action="store_true")
+    rollout.add_argument("--rdx-host", default="127.0.0.1")
+    rollout.add_argument("--rdx-port", type=int, default=2102)
+
+    status = commands.add_parser("rollout-status", help="Show a rollout record.")
+    status.add_argument("rollout_id")
+    logs = commands.add_parser("rollout-logs", help="Show rollout logs.")
+    logs.add_argument("rollout_id")
+    stop = commands.add_parser("rollout-stop", help="Stop a running rollout.")
+    stop.add_argument("rollout_id")
     return parser
+
+
+def _run_rollout_command(args: argparse.Namespace) -> None:
+    from lelab.alex_models import RolloutConfig
+    from lelab.rollouts import rollout_manager
+
+    if args.command == "rollout":
+        config = RolloutConfig(
+            target=args.target,
+            inference_location="local" if args.local_inference else "remote",
+            job_id=args.job_id,
+            policy_ref=args.policy_ref,
+            checkpoint=args.checkpoint,
+            dataset_repo_id=args.dataset_repo,
+            gpu=args.gpu,
+            task=args.task,
+            fps=args.fps,
+            environment=args.environment,
+            usd=args.usd,
+            embodiment=args.embodiment,
+            num_episodes=args.episodes,
+            headless=not args.show,
+            video=args.video,
+            camera_video=args.camera_video,
+            ikstreamer_host=args.rdx_host,
+            ikstreamer_port=args.rdx_port,
+        )
+        record = rollout_manager.start(config)
+        print(record.model_dump_json(indent=2))
+        if record.state == "blocked":
+            raise SystemExit(2)
+        return
+    if args.command == "rollout-status":
+        print(rollout_manager.get(args.rollout_id).model_dump_json(indent=2))
+        return
+    if args.command == "rollout-logs":
+        print(rollout_manager.logs(args.rollout_id))
+        return
+    if args.command == "rollout-stop":
+        print(rollout_manager.stop(args.rollout_id).model_dump_json(indent=2))
+        return
 
 
 def main(argv: Sequence[str] | None = None) -> None:
     parser = _build_parser()
     args = parser.parse_args(argv)
+
+    if args.command:
+        _run_rollout_command(args)
+        return
 
     if args.stop:
         _run_stop()

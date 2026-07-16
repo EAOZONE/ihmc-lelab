@@ -1,7 +1,11 @@
 import shlex
 
 from lelab.alex_models import LeRobotTrainingConfig, RemoteTrainingRequest
-from lelab.remote_jobs import RemoteJobManager, build_remote_docker_command
+from lelab.remote_jobs import (
+    RemoteJobManager,
+    build_remote_docker_command,
+    parse_remote_metrics_history,
+)
 
 
 class FakeCluster:
@@ -39,6 +43,7 @@ def test_docker_command_is_named_detached_and_multi_gpu() -> None:
     assert "$HOME/miniconda3/bin/hf" in command
     assert "accelerate launch --multi_gpu --num_processes 2 --module lerobot.scripts.lerobot_train" in command
     assert "--env HF_TOKEN" in command
+    assert "ALEX_VIDEO_TIMESTAMP_TOLERANCE_S=0.012" in command
     assert "alex_job-1_checkpoints:/outputs" in command
     assert "secret" not in command.lower()
 
@@ -109,3 +114,22 @@ def test_remote_job_manager_loads_legacy_ccil_history(tmp_path) -> None:
     )
     manager = RemoteJobManager(tmp_path, cluster=FakeCluster())
     assert manager.get("ccil-old", refresh=False).kind == "ccil"
+
+
+def test_remote_metric_history_parses_and_deduplicates_lerobot_logs() -> None:
+    points = parse_remote_metrics_history(
+        "\n".join(
+            [
+                "2026-01-01 INFO step:100 smpl:3200 loss:0.42 grdn:1.5 lr:1.0e-04",
+                "Training: 2%| | 200/10000 [00:10<08:00]",
+                "2026-01-01 INFO step:200 smpl:6400 loss:0.31 grdn:1.2 lr:9.5e-05",
+                "2026-01-01 INFO step:200 smpl:6400 loss:0.30 grdn:1.1 lr:9.4e-05",
+            ]
+        )
+    )
+
+    assert [point.step for point in points] == [100, 200]
+    assert points[0].loss == 0.42
+    assert points[0].lr == 1.0e-4
+    assert points[1].loss == 0.30
+    assert points[1].lr == 9.4e-5
