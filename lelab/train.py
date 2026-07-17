@@ -28,6 +28,24 @@ if TYPE_CHECKING:
     from lelab.jobs import JobTarget
 
 _SLUG_RE = re.compile(r"[^a-zA-Z0-9._-]+")
+_ALEX_TEST_OBS_NEW_STATE_DIM = 48
+_ALEX_TEST_OBS_NEW_ACTION_DIM = 46
+_ALEX_TEST_OBS_NEW_REPOS = {
+    "H2Ozone/test_obs_new",
+    "H2Ozone/split_data",
+    "H2Ozone/full_dataset",
+    "H2Ozone/new_full_data",
+}
+_MAX_DIM_POLICY_TYPES = {
+    "eo1",
+    "evo1",
+    "pi0",
+    "pi05",
+    "pi0_fast",
+    "smolvla",
+    "wall_x",
+    "xvla",
+}
 
 
 class TrainingRequest(BaseModel):
@@ -104,6 +122,32 @@ class TrainingRequest(BaseModel):
     config_path: str | None = None
 
 
+def _alex_test_obs_new_policy_overrides(policy_type: str) -> list[str]:
+    """Return policy flags for Alex 48-D state / 46-D action datasets."""
+    if policy_type in _MAX_DIM_POLICY_TYPES:
+        return [
+            "--policy.max_state_dim",
+            str(_ALEX_TEST_OBS_NEW_STATE_DIM),
+            "--policy.max_action_dim",
+            str(_ALEX_TEST_OBS_NEW_ACTION_DIM),
+        ]
+    if policy_type == "fastwam":
+        return [
+            "--policy.action_dim",
+            str(_ALEX_TEST_OBS_NEW_ACTION_DIM),
+            "--policy.proprio_dim",
+            str(_ALEX_TEST_OBS_NEW_STATE_DIM),
+        ]
+    if policy_type == "lingbot_va":
+        return [
+            "--policy.action_dim",
+            str(_ALEX_TEST_OBS_NEW_ACTION_DIM),
+            "--policy.used_action_channel_ids",
+            json.dumps(list(range(_ALEX_TEST_OBS_NEW_ACTION_DIM))),
+        ]
+    return []
+
+
 def build_training_command(
     request: TrainingRequest,
     output_dir: str,
@@ -137,6 +181,8 @@ def build_training_command(
 
     # Policy
     cmd.extend(["--policy.type", request.policy_type])
+    if request.dataset_repo_id in _ALEX_TEST_OBS_NEW_REPOS:
+        cmd.extend(_alex_test_obs_new_policy_overrides(request.policy_type))
 
     # Core training params
     cmd.extend(["--steps", str(request.steps)])

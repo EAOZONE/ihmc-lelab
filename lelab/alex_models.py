@@ -18,7 +18,12 @@ _HUB_REPO = re.compile(r"^[^\s/]+/[^\s/]+$")
 
 _ALEX_TEST_OBS_NEW_STATE_DIM = 48
 _ALEX_TEST_OBS_NEW_ACTION_DIM = 46
-_ALEX_TEST_OBS_NEW_REPOS = {"H2Ozone/test_obs_new"}
+_ALEX_TEST_OBS_NEW_REPOS = {
+    "H2Ozone/test_obs_new",
+    "H2Ozone/split_data",
+    "H2Ozone/full_dataset",
+    "H2Ozone/new_full_data",
+}
 _MAX_DIM_POLICY_TYPES = {
     "eo1",
     "evo1",

@@ -20,6 +20,7 @@ from .jobs import MetricsHistoryPoint, TrainingMetrics, parse_metrics_into
 
 RemoteJobState = Literal["running", "done", "failed", "stopped", "unknown"]
 _CONTAINER_SAFE = re.compile(r"[^a-z0-9_.-]+")
+DEFAULT_REMOTE_HF_CACHE_DIR = "/home/bpratt/hf-cache/huggingface"
 
 
 class RemoteJobRecord(BaseModel):
@@ -88,16 +89,25 @@ def build_remote_docker_command(
         f"alex.job_id={job_id}",
     ]
     output_dir = "/outputs/run"
-    video_tolerance_s = os.environ.get("ALEX_VIDEO_TIMESTAMP_TOLERANCE_S", "0.012")
+    hf_cache_dir = remote_hf_cache_dir()
+    video_tolerance_s = os.environ.get("ALEX_VIDEO_TIMESTAMP_TOLERANCE_S", "0.08")
     argv += [
         "--env",
         "HF_TOKEN",
         "--env",
         "HF_HOME=/cache/huggingface",
         "--env",
+        "HF_HUB_CACHE=/cache/huggingface/hub",
+        "--env",
+        "HF_DATASETS_CACHE=/cache/huggingface/datasets",
+        "--env",
+        "HF_LEROBOT_HOME=/cache/huggingface/lerobot",
+        "--env",
+        "TMPDIR=/cache/huggingface/tmp",
+        "--env",
         f"ALEX_VIDEO_TIMESTAMP_TOLERANCE_S={video_tolerance_s}",
     ]
-    argv += ["--volume", "alex_hf_cache:/cache/huggingface"]
+    argv += ["--volume", f"{hf_cache_dir}:/cache/huggingface"]
     argv += ["--volume", f"alex_{job_id}_checkpoints:/outputs"]
     argv.append(image or remote_training_image())
     manifest = {
@@ -117,11 +127,27 @@ def build_remote_docker_command(
     ]
     argv += build_lerobot_training_command(config, output_dir, len(gpu_uuids))
     launch = shlex.join(argv)
-    return with_remote_hf_token(launch)
+    return with_remote_hf_token(remote_cache_prelude(hf_cache_dir) + launch)
 
 
 def remote_training_image() -> str:
     return os.environ.get("ALEX_LEROBOT_IMAGE", "alex-lerobot-train:0.6.0")
+
+
+def remote_hf_cache_dir() -> str:
+    """Return the remote host directory bind-mounted as the container HF cache."""
+    value = os.environ.get("ALEX_REMOTE_HF_CACHE_DIR", DEFAULT_REMOTE_HF_CACHE_DIR).strip()
+    if not value:
+        return DEFAULT_REMOTE_HF_CACHE_DIR
+    if not value.startswith("/"):
+        raise ValueError("ALEX_REMOTE_HF_CACHE_DIR must be an absolute path on the remote host")
+    return value
+
+
+def remote_cache_prelude(hf_cache_dir: str) -> str:
+    """Create writable cache directories on the remote host before Docker starts."""
+    quoted = shlex.quote(hf_cache_dir)
+    return f"mkdir -p {quoted}/hub {quoted}/datasets {quoted}/lerobot {quoted}/tmp; "
 
 
 def with_remote_hf_token(command: str) -> str:

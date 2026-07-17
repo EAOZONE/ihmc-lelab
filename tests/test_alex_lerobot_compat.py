@@ -148,5 +148,5 @@ def test_video_timestamp_patch_keeps_larger_tolerance(monkeypatch) -> None:
 
     module._patch_video_timestamp_tolerance()
 
-    assert video_utils.decode_video_frames("video.mp4", [1.0], 0.02, "pyav") == "frames"
-    assert calls == [(0.02, "pyav")]
+    assert video_utils.decode_video_frames("video.mp4", [1.0], 0.1, "pyav") == "frames"
+    assert calls == [(0.1, "pyav")]

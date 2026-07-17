@@ -241,6 +241,21 @@ def test_test_obs_new_adds_policy_dimension_overrides() -> None:
     assert lingbot[lingbot.index("--policy.used_action_channel_ids") + 1].endswith("45]")
 
 
+def test_full_dataset_adds_pi05_dimension_overrides() -> None:
+    for repo_id in ["H2Ozone/full_dataset", "H2Ozone/new_full_data"]:
+        command = build_lerobot_training_command(
+            LeRobotTrainingConfig(
+                dataset_repo_id=repo_id,
+                model_repo_id="user/alex-pi05",
+                policy_type="pi05",
+            ),
+            "/outputs/run",
+            1,
+        )
+        assert command[command.index("--policy.max_state_dim") + 1] == "48"
+        assert command[command.index("--policy.max_action_dim") + 1] == "46"
+
+
 def test_isaaclab_rollout_command_uses_direct_launcher() -> None:
     config = RolloutConfig(
         target="sim",

@@ -173,3 +173,15 @@ def test_local_target_keeps_push_to_hub() -> None:
     assert _arg_value(cmd, "--policy.push_to_hub") == "true"
     assert _arg_value(cmd, "--policy.repo_id") == "me/x"
     assert "--job.target" not in cmd
+
+
+def test_alex_full_dataset_pi05_sets_policy_dimensions() -> None:
+    from lelab.train import TrainingRequest, build_training_command
+
+    for repo_id in ["H2Ozone/full_dataset", "H2Ozone/new_full_data"]:
+        cmd = build_training_command(
+            TrainingRequest(dataset_repo_id=repo_id, policy_type="pi05"),
+            "/tmp/out",
+        )
+        assert _arg_value(cmd, "--policy.max_state_dim") == "48"
+        assert _arg_value(cmd, "--policy.max_action_dim") == "46"

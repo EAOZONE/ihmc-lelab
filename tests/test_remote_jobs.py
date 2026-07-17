@@ -26,7 +26,8 @@ class FakeCluster:
         return 0, "container-id\n", ""
 
 
-def test_docker_command_is_named_detached_and_multi_gpu() -> None:
+def test_docker_command_is_named_detached_and_multi_gpu(monkeypatch) -> None:
+    monkeypatch.delenv("ALEX_REMOTE_HF_CACHE_DIR", raising=False)
     config = LeRobotTrainingConfig(
         dataset_repo_id="user/alex",
         model_repo_id="user/alex-act",
@@ -42,8 +43,15 @@ def test_docker_command_is_named_detached_and_multi_gpu() -> None:
     assert "$HOME/.local/bin/hf" in command
     assert "$HOME/miniconda3/bin/hf" in command
     assert "accelerate launch --multi_gpu --num_processes 2 --module lerobot.scripts.lerobot_train" in command
+    assert "mkdir -p /home/bpratt/hf-cache/huggingface/hub" in command
     assert "--env HF_TOKEN" in command
-    assert "ALEX_VIDEO_TIMESTAMP_TOLERANCE_S=0.012" in command
+    assert "HF_HOME=/cache/huggingface" in command
+    assert "HF_DATASETS_CACHE=/cache/huggingface/datasets" in command
+    assert "HF_LEROBOT_HOME=/cache/huggingface/lerobot" in command
+    assert "--env LEROBOT_HOME=/cache/huggingface/lerobot" not in command
+    assert "TMPDIR=/cache/huggingface/tmp" in command
+    assert "ALEX_VIDEO_TIMESTAMP_TOLERANCE_S=0.08" in command
+    assert "/home/bpratt/hf-cache/huggingface:/cache/huggingface" in command
     assert "alex_job-1_checkpoints:/outputs" in command
     assert "secret" not in command.lower()
 
